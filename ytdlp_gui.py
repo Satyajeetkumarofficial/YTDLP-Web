@@ -119,6 +119,21 @@ def log_format_summary(info, formats):
                  human_size(x.get("size")) if x.get("size") else "unavailable",
                  x.get("format") or "")
 
+
+def validate_cookie_file(path):
+    """Validate a Netscape-format cookie.txt without logging cookie values."""
+    try:
+        raw = Path(path).read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return False
+    lines = [x.strip() for x in raw.splitlines() if x.strip() and not x.lstrip().startswith("#")]
+    if not lines:
+        return False
+    # Netscape cookie files normally have 7 tab-separated columns.
+    good = sum(1 for line in lines if len(line.split("\t")) >= 7)
+    return good > 0
+
+
 def human_size(n):
     if not n:
         return "Size unavailable"
@@ -232,6 +247,9 @@ PAGE = r"""
 #msg{min-height:42px;padding:15px 2px;color:var(--muted)}.title{font-size:18px;font-weight:800;margin:5px 0 13px}.section{margin-top:18px}.section h2{font-size:12px;color:var(--muted);letter-spacing:.13em;text-transform:uppercase;margin:0 0 10px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:10px}.card{background:linear-gradient(145deg,var(--surface),var(--surface2));border:1px solid var(--line);border-radius:15px;padding:13px;display:flex;align-items:center;justify-content:space-between;gap:12px;transition:.16s}.card:hover{transform:translateY(-1px);border-color:#385174}.info b{font-size:15px}.info small{display:block;color:var(--muted);margin-top:4px}.info small:last-child{color:#a9bce0;font-size:11px}.dl{border:1px solid #304768;background:#142238;color:#e9f1ff;border-radius:10px;padding:10px 13px;font-weight:800;cursor:pointer}.dl:hover{background:#1a2d48}.progress{height:5px;background:#0a0f17;border-radius:99px;margin-top:16px;overflow:hidden}.progress div{height:100%;width:0;background:linear-gradient(90deg,var(--a),var(--b));transition:width .2s}.status{font-size:12px;color:var(--muted);margin-top:8px}.foot{text-align:center;color:#657289;font-size:11px;margin-top:30px}
 @media(max-width:620px){.top{margin-bottom:18px}.search{flex-direction:column}.primary{height:48px}.card{align-items:flex-start}.dl{padding:9px 10px}}
+.cookie-box{margin-top:12px;padding:14px 16px;border:1px solid rgba(255,255,255,.12);border-radius:14px;background:rgba(255,255,255,.04)}
+.cookie-title{font-weight:700;margin-bottom:5px}.cookie-help{font-size:12px;opacity:.72;margin-bottom:9px}
+.cookie-box input{max-width:100%}
 </style></head>
 <body><main class="wrap">
 <div class="top"><div class="logo">⚡ MediaFlow <i>PRO</i></div><div class="badge">Koyeb Ready</div></div>

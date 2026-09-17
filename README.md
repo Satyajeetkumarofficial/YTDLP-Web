@@ -75,3 +75,10 @@ This build does not force a global `impersonate` target through the Python API.
 Modern yt-dlp versions can reject a plain string target in `YoutubeDL(...)`.
 `curl-cffi` remains installed so yt-dlp can use browser impersonation where an
 extractor/request requires it.
+
+
+### Optional cookie.txt
+The web UI accepts an optional Netscape-format `cookie.txt` upload for sites
+that require the user's authenticated session. Cookies are used only for the
+current analysis/download job and are stored temporarily; cookie contents are
+not written to logs. Do not upload cookies you do not own or have permission to use.
