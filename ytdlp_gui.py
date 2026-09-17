@@ -298,7 +298,7 @@ def formats_api():
         return jsonify(error="Invalid or blocked URL."),400
     try:
         opts={"quiet":True,"no_warnings":True,"skip_download":True,"noplaylist":True,
-              "js_runtimes":["deno"],
+              "js_runtimes":{"deno":{}},
               "impersonate":"chrome",
               "socket_timeout":20,"retries":3,"extractor_retries":3,
               "http_chunk_size":10485760,
@@ -356,7 +356,7 @@ def download(token):
             "format":fmt["format"],"outtmpl":out,"noplaylist":True,
             "quiet":True,"no_warnings":True,"retries":3,"fragment_retries":3,
             "concurrent_fragment_downloads":4,"socket_timeout":30,
-            "js_runtimes":["deno"],
+            "js_runtimes":{"deno":{}},
             "impersonate":"chrome",
             "http_chunk_size":10485760,
             "retry_sleep_functions":{"http": lambda n: min(10, 1.5 ** n)},

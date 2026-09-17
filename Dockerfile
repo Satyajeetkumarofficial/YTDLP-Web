@@ -9,9 +9,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Deno is the recommended JS runtime for yt-dlp EJS.
 RUN curl -fsSL https://deno.land/install.sh | sh \
-    && mv /usr/local/bin/deno /usr/local/bin/deno.real 2>/dev/null || true
-# The installer location differs by image/user; normalize PATH if needed.
-ENV PATH="/root/.deno:/usr/local/bin:${PATH}"
+    && deno --version
+ENV PATH="/root/.deno/bin:/usr/local/bin:${PATH}"
 
 WORKDIR /app
 COPY requirements.txt .
