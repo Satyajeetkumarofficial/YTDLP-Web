@@ -1,6 +1,7 @@
 import os, re, time, uuid, hmac, json, socket, hashlib, tempfile, threading, ipaddress, shutil, logging
 from pathlib import Path
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify, render_template_string, send_file
 import yt_dlp
 
@@ -16,6 +17,10 @@ JOB_TTL = int(os.getenv("JOB_TTL", "1800"))
 RATE_LIMIT = int(os.getenv("RATE_LIMIT_PER_MINUTE", "30"))
 MAX_FILE_GB = float(os.getenv("MAX_FILE_GB", "4"))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "2"))
+MAX_TOTAL_STORAGE_GB = float(os.getenv("MAX_TOTAL_STORAGE_GB", "6"))
+REAP_INTERVAL = int(os.getenv("REAP_INTERVAL_SECONDS", "45"))
+PROBE_TIMEOUT = float(os.getenv("PROBE_TIMEOUT_SECONDS", "4"))
+PROBE_WORKERS = int(os.getenv("PROBE_WORKERS", "8"))
 COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt")
 TMP_ROOT = os.path.join(tempfile.gettempdir(), "mediaflow")
 os.makedirs(TMP_ROOT, exist_ok=True)
@@ -23,6 +28,7 @@ os.makedirs(TMP_ROOT, exist_ok=True)
 JOBS, RATE = {}, {}
 LOCK = threading.RLock()
 SEM = threading.BoundedSemaphore(MAX_CONCURRENT)
+PROBE_POOL = ThreadPoolExecutor(max_workers=PROBE_WORKERS)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("mediaflow")
@@ -51,6 +57,15 @@ def heta(n):
     m, s = divmod(n, 60)
     h, m = divmod(m, 60)
     return f"{h}h {m}m {s}s" if h else (f"{m}m {s}s" if m else f"{s}s")
+
+
+def hdur(n):
+    if not n:
+        return None
+    n = int(n)
+    m, s = divmod(n, 60)
+    h, m = divmod(m, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 def safe(name):
@@ -116,8 +131,60 @@ def cookie_path():
     return str(p) if p.is_file() and p.stat().st_size > 0 else None
 
 
+# ---------------------------------------------------------------------------
+# Storage accounting — keeps MediaFlow inside a small hosting disk (Koyeb etc.)
+# ---------------------------------------------------------------------------
+
+def dir_size_bytes(path):
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
+def storage_ok_for(extra_gb):
+    limit = MAX_TOTAL_STORAGE_GB * 1024**3
+    used = dir_size_bytes(TMP_ROOT)
+    return (used + extra_gb * 1024**3) <= limit
+
+
+def reaper():
+    """Background sweep: removes stale job workdirs so temp storage never
+    grows unbounded, even if a browser never comes back to claim a file."""
+    while True:
+        time.sleep(REAP_INTERVAL)
+        now = time.time()
+        stale = []
+        with LOCK:
+            for job_id, job in list(JOBS.items()):
+                status = job.get("status")
+                age = now - job.get("created", now)
+                if status in ("downloading", "starting"):
+                    continue
+                if status in ("ready", "error") and age > JOB_TTL:
+                    stale.append((job_id, job.get("workdir")))
+                elif status == "analyzed" and age > JOB_TTL * 2:
+                    stale.append((job_id, None))
+        for job_id, workdir in stale:
+            cleanup_job(job_id, workdir)
+        if stale:
+            log.info("REAPER cleaned %d stale job(s)", len(stale))
+
+
+threading.Thread(target=reaper, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Format discovery — sized concurrently and deduplicated before any network
+# probing happens, so "Analyze" stays fast even on sources with 30+ streams.
+# ---------------------------------------------------------------------------
+
 def tiny_probe(url):
-    """Try a 1-byte range probe. Never intentionally downloads the whole object."""
+    """1-byte range probe, bounded by PROBE_TIMEOUT. Never downloads the body."""
     if not requests or not url:
         return None
     try:
@@ -125,7 +192,7 @@ def tiny_probe(url):
             url,
             headers={"Range": "bytes=0-0", "User-Agent": "Mozilla/5.0"},
             stream=True,
-            timeout=10,
+            timeout=PROBE_TIMEOUT,
             allow_redirects=True,
         )
         cr = r.headers.get("Content-Range", "")
@@ -143,22 +210,35 @@ def tiny_probe(url):
         return None
 
 
-def fsize(fmt, duration):
-    for key in ("filesize", "filesize_approx"):
-        if fmt.get(key):
-            return int(fmt[key])
-
-    # User requirement: probe the source when metadata does not expose size.
-    probed = tiny_probe(fmt.get("url"))
-    if probed is not None:
-        return probed
-
+def bitrate_estimate(fmt, duration):
     if duration and fmt.get("tbr"):
         try:
             return int(float(fmt["tbr"]) * 1000 / 8 * float(duration))
         except Exception:
             pass
     return None
+
+
+def resolve_size(fmt, duration):
+    """Returns (bytes, exact). Only probes the network as a last resort, and
+    only for the small, already-deduplicated set of formats we plan to show."""
+    for key in ("filesize", "filesize_approx"):
+        if fmt.get(key):
+            return int(fmt[key]), True
+
+    estimate = bitrate_estimate(fmt, duration)
+    probed = tiny_probe(fmt.get("url"))
+    if probed is not None:
+        return probed, True
+    if estimate is not None:
+        return estimate, False
+    return None, False
+
+
+def size_label(bytes_, exact):
+    if bytes_ is None:
+        return "Size unavailable"
+    return hs(bytes_) if exact else "≈ " + hs(bytes_)
 
 
 def reslabel(fmt):
@@ -173,6 +253,17 @@ def reslabel(fmt):
     return f"{h}p"
 
 
+def pick_container(video, audio):
+    """One sane container per resolution instead of always offering both
+    MP4 and MKV — halves the list size, which is most of what made the
+    results feel sluggish to render and probe."""
+    vext = (video.get("ext") or "").lower()
+    aext = (audio.get("ext") or "").lower() if audio else ""
+    if vext in ("mp4", "m4v") and (not audio or aext in ("m4a", "mp4", "aac")):
+        return "mp4"
+    return "mkv"
+
+
 def make_formats(info):
     duration = info.get("duration")
     videos, audios = [], []
@@ -180,66 +271,82 @@ def make_formats(info):
     for raw in info.get("formats") or []:
         if not raw.get("format_id"):
             continue
-        fmt = dict(raw)
-        fmt["_size"] = fsize(fmt, duration)
-        if fmt.get("vcodec") not in (None, "none"):
-            videos.append(fmt)
-        elif fmt.get("acodec") not in (None, "none"):
-            audios.append(fmt)
+        if raw.get("vcodec") not in (None, "none"):
+            videos.append(raw)
+        elif raw.get("acodec") not in (None, "none"):
+            audios.append(raw)
 
-    best_audio = max(
-        audios,
-        key=lambda x: (x.get("abr") or 0, x.get("_size") or 0),
-        default=None,
-    )
+    # Rank first, size later — sizing is the expensive part.
+    audios.sort(key=lambda x: x.get("abr") or 0, reverse=True)
+    best_audio = audios[0] if audios else None
 
-    out, seen = [], set()
     videos.sort(
-        key=lambda x: (
-            x.get("height") or 0,
-            x.get("width") or 0,
-            x.get("tbr") or 0,
-        ),
+        key=lambda x: (x.get("height") or 0, x.get("width") or 0, x.get("tbr") or 0),
         reverse=True,
     )
-
+    deduped_videos, seen = [], set()
     for video in videos:
         key = (video.get("width"), video.get("height"))
         if key in seen:
             continue
         seen.add(key)
+        deduped_videos.append(video)
 
-        size = video.get("_size")
-        if best_audio and size is not None and best_audio.get("_size") is not None:
-            size += best_audio["_size"]
+    top_audios = audios[:8]
 
+    # Size every format we might actually show, concurrently, once each.
+    to_size = list(deduped_videos) + list(top_audios)
+    if best_audio is not None and best_audio not in to_size:
+        to_size.append(best_audio)
+
+    sizes = {}
+    futures = {
+        id(fmt): PROBE_POOL.submit(resolve_size, fmt, duration)
+        for fmt in to_size
+    }
+    for fmt in to_size:
+        try:
+            sizes[id(fmt)] = futures[id(fmt)].result(timeout=PROBE_TIMEOUT + 2)
+        except Exception:
+            sizes[id(fmt)] = (bitrate_estimate(fmt, duration), False)
+
+    audio_size = sizes.get(id(best_audio)) if best_audio else (None, False)
+
+    out = []
+    for video in deduped_videos:
+        vbytes, vexact = sizes.get(id(video), (None, False))
+        total_bytes, total_exact = vbytes, vexact
+        if best_audio and vbytes is not None and audio_size[0] is not None:
+            total_bytes = vbytes + audio_size[0]
+            total_exact = vexact and audio_size[1]
+
+        container = pick_container(video, best_audio)
         selector = video["format_id"] + (f"+{best_audio['format_id']}" if best_audio else "")
+        out.append({
+            "kind": "video",
+            "label": f"{reslabel(video)} • {container.upper()}",
+            "detail": "Video + best audio",
+            "size": size_label(total_bytes, total_exact),
+            "size_bytes": total_bytes,
+            "selector": selector,
+            "container": container,
+        })
 
-        for container in ("mp4", "mkv"):
-            out.append({
-                "kind": "video",
-                "label": f"{reslabel(video)} • {container.upper()}",
-                "detail": "Video + best audio",
-                "size": hs(size),
-                "size_bytes": size,
-                "selector": selector,
-                "container": container,
-            })
-
-    for audio in sorted(audios, key=lambda x: x.get("abr") or 0, reverse=True)[:12]:
+    for audio in top_audios:
         ext = (audio.get("ext") or "m4a").lower()
         abr = audio.get("abr")
+        abytes, aexact = sizes.get(id(audio), (None, False))
         out.append({
             "kind": "audio",
             "label": f"{ext.upper()} • {int(abr) if abr else '?'} kbps",
             "detail": "Original audio",
-            "size": hs(audio.get("_size")),
-            "size_bytes": audio.get("_size"),
+            "size": size_label(abytes, aexact),
+            "size_bytes": abytes,
             "selector": audio["format_id"],
             "container": ext,
         })
 
-    return out[:80]
+    return out[:40]
 
 
 def cleanup_job(job_id, workdir=None):
@@ -280,6 +387,7 @@ def analyze():
 
     job_id = uuid.uuid4().hex
     cp = cookie_path()
+    t0 = time.time()
 
     try:
         opts = {
@@ -312,12 +420,9 @@ def analyze():
         }
 
         log.info(
-            "ANALYSIS RESULT | extractor=%s | title=%s | uploader=%s | duration=%s | formats=%d",
-            info.get("extractor"),
-            info.get("title"),
-            info.get("uploader"),
-            info.get("duration"),
-            len(formats),
+            "ANALYSIS RESULT | extractor=%s | title=%s | duration=%s | formats=%d | took=%.2fs",
+            info.get("extractor"), info.get("title"), info.get("duration"),
+            len(formats), time.time() - t0,
         )
 
         result = []
@@ -326,15 +431,13 @@ def analyze():
             item.pop("selector", None)
             item.pop("size_bytes", None)
             result.append(item)
-            log.info(
-                "FORMAT | index=%d | kind=%s | label=%s | size=%s | selector=%s",
-                i, fmt["kind"], fmt["label"], fmt["size"], fmt["selector"]
-            )
 
         return jsonify(
             job_id=job_id,
             title=JOBS[job_id]["title"],
             thumbnail=info.get("thumbnail"),
+            uploader=info.get("uploader"),
+            duration=hdur(info.get("duration")),
             formats=result,
         )
 
@@ -369,11 +472,6 @@ def worker(job_id, fmt, workdir):
                     speed=hspeed(data.get("speed")),
                     eta=heta(data.get("eta")),
                 )
-                log.info(
-                    "PROGRESS job=%s %.1f%% %s/%s speed=%s ETA=%s",
-                    job_id, st["percent"], st["downloaded"], st["total"],
-                    st["speed"], st["eta"],
-                )
             elif data.get("status") == "finished":
                 st["percent"] = 100
 
@@ -397,10 +495,7 @@ def worker(job_id, fmt, workdir):
         if cp:
             opts["cookiefile"] = cp
 
-        log.info(
-            "DOWNLOAD START | job=%s | label=%s | selector=%s | workdir=%s",
-            job_id, fmt["label"], fmt["selector"], workdir
-        )
+        log.info("DOWNLOAD START | job=%s | label=%s | selector=%s", job_id, fmt["label"], fmt["selector"])
 
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([job["url"]])
@@ -427,10 +522,10 @@ def worker(job_id, fmt, workdir):
     except Exception as exc:
         job.update(status="error", error=str(exc))
         log.exception("DOWNLOAD failed job=%s", job_id)
+        shutil.rmtree(workdir, ignore_errors=True)
     finally:
         try:
             SEM.release()
-            log.info("DOWNLOAD SLOT RELEASED | job=%s", job_id)
         except Exception:
             log.exception("Failed to release download slot | job=%s", job_id)
 
@@ -462,6 +557,9 @@ def start_download(token):
             return jsonify(status="downloading")
         if job.get("status") == "error":
             return jsonify(status="error", error=job.get("error"))
+
+        if not storage_ok_for(MAX_FILE_GB):
+            return jsonify(error="Server storage is nearly full. Please try again shortly."), 503
 
         if not SEM.acquire(blocking=False):
             return jsonify(error="All download slots are currently in use. Please try again in a few seconds."), 503
@@ -533,55 +631,112 @@ PAGE = r"""<!doctype html>
 <title>MediaFlow PRO</title>
 <style>
 :root{
-  --bg:#080b11;--panel:#111722;--panel2:#0d131d;--line:#273246;
-  --text:#f5f7fb;--muted:#8f9db0;--blue:#5aa8ff;--green:#35c995;--danger:#ff6b78;
+  --bg:#070a10;--panel:rgba(22,29,43,.72);--panel-solid:#131a27;--line:rgba(255,255,255,.08);
+  --text:#f5f7fb;--muted:#8d9bb0;--blue:#5aa8ff;--blue2:#8f6bff;--green:#33d19a;--danger:#ff6b78;
+  --radius:18px;
 }
 *{box-sizing:border-box}
-body{margin:0;background:linear-gradient(180deg,#080b11 0%,#0b1018 100%);color:var(--text);
-font:15px/1.45 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-.wrap{max-width:900px;margin:auto;padding:38px 18px 70px}
-.header{margin-bottom:24px}
-.brand{font-size:32px;font-weight:850;letter-spacing:-.8px}
-.sub{color:var(--muted);margin-top:4px}
-.panel{background:rgba(17,23,34,.92);border:1px solid var(--line);border-radius:18px;padding:18px;
-box-shadow:0 14px 40px rgba(0,0,0,.22)}
+html,body{height:100%}
+body{
+  margin:0;color:var(--text);
+  font:15px/1.5 "Segoe UI",system-ui,-apple-system,BlinkMacSystemFont,sans-serif;
+  background:
+    radial-gradient(1100px 600px at 12% -10%, rgba(90,168,255,.16), transparent 60%),
+    radial-gradient(900px 500px at 110% 10%, rgba(143,107,255,.14), transparent 55%),
+    var(--bg);
+  min-height:100%;
+}
+.wrap{max-width:860px;margin:auto;padding:42px 18px 80px}
+.header{margin-bottom:26px;display:flex;align-items:center;gap:14px}
+.logo{width:44px;height:44px;border-radius:13px;flex:none;
+  background:linear-gradient(135deg,var(--blue),var(--blue2));
+  display:flex;align-items:center;justify-content:center;font-weight:900;font-size:18px;color:#07111e;
+  box-shadow:0 8px 24px rgba(90,168,255,.35)}
+.brand{font-size:26px;font-weight:800;letter-spacing:-.5px}
+.sub{color:var(--muted);margin-top:2px;font-size:13.5px}
+
+.panel{
+  background:var(--panel);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);
+  border:1px solid var(--line);border-radius:var(--radius);padding:18px;
+  box-shadow:0 20px 50px rgba(0,0,0,.35);
+}
 .inputrow{display:flex;gap:10px}
-.url{width:100%;min-width:0;background:#0a1019;color:#fff;border:1px solid #2a374b;border-radius:12px;
-padding:14px 15px;font-size:15px;outline:none}
-.url:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(90,168,255,.12)}
-.btn{border:0;border-radius:12px;padding:13px 20px;font-weight:800;cursor:pointer;
-background:var(--blue);color:#07111e;white-space:nowrap}
-.btn:disabled{opacity:.55;cursor:not-allowed}
-.msg{min-height:22px;color:var(--muted);margin-top:12px}
-.section-title{font-size:18px;font-weight:800;margin:22px 2px 10px}
-.format{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:16px;margin:10px 0}
-.frow{display:flex;align-items:center;gap:14px}
-.info{min-width:0;flex:1}
-.label{font-size:17px;font-weight:800}
-.detail{color:var(--muted);margin-top:2px}
-.size{color:#cbd6e5;font-weight:750}
-.action{min-width:120px}
-.download{width:100%;background:var(--green);color:#06150f}
-.progress{height:7px;background:#080d14;border-radius:99px;overflow:hidden;margin-top:12px}
-.progress i{display:block;height:100%;width:0;background:var(--blue);transition:width .2s}
-.status{color:var(--muted);font-size:13px;margin-top:7px;min-height:19px}
-.note{color:var(--muted);font-size:13px;margin-top:10px}
+.url{width:100%;min-width:0;background:#0b1119;color:#fff;border:1px solid #263248;border-radius:13px;
+  padding:14px 15px;font-size:15px;outline:none;transition:border-color .15s,box-shadow .15s}
+.url:focus{border-color:var(--blue);box-shadow:0 0 0 4px rgba(90,168,255,.14)}
+.url::placeholder{color:#5b6a80}
+.btn{border:0;border-radius:13px;padding:13px 22px;font-weight:800;cursor:pointer;
+  background:linear-gradient(135deg,var(--blue),#4a8fe0);color:#07111e;white-space:nowrap;
+  transition:transform .12s ease,filter .12s ease,opacity .12s ease}
+.btn:hover:not(:disabled){filter:brightness(1.08);transform:translateY(-1px)}
+.btn:active:not(:disabled){transform:translateY(0)}
+.btn:disabled{opacity:.5;cursor:not-allowed;transform:none}
+.msg{min-height:20px;color:var(--muted);margin-top:12px;font-size:13.5px;transition:color .15s}
+.note{color:#5b6a80;font-size:12.5px;margin-top:10px}
 .error{color:var(--danger)}
+
+.meta{display:flex;gap:14px;margin-top:16px;align-items:center}
+.thumb{width:120px;height:68px;border-radius:11px;object-fit:cover;flex:none;
+  background:#0b1119;border:1px solid var(--line)}
+.meta-text{min-width:0}
+.meta-title{font-weight:750;font-size:15px;line-height:1.3;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.meta-sub{color:var(--muted);font-size:12.5px;margin-top:4px}
+
+.section-title{font-size:15px;font-weight:800;letter-spacing:.3px;text-transform:uppercase;
+  color:var(--muted);margin:26px 4px 12px;display:flex;align-items:center;gap:8px}
+
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:650px){.grid{grid-template-columns:1fr}}
+
+.format{
+  background:var(--panel-solid);border:1px solid var(--line);border-radius:15px;padding:15px;
+  animation:rise .28s ease both;transition:border-color .15s,transform .12s;
+}
+.format:hover{border-color:rgba(90,168,255,.35)}
+@keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.frow{display:flex;align-items:center;gap:12px}
+.icon{width:34px;height:34px;border-radius:10px;flex:none;display:flex;align-items:center;justify-content:center;
+  background:rgba(90,168,255,.12);font-size:16px}
+.icon.audio{background:rgba(51,209,154,.12)}
+.info{min-width:0;flex:1}
+.label{font-size:15.5px;font-weight:800}
+.detail{color:var(--muted);margin-top:2px;font-size:12.5px}
+.size{color:#cfe0f5;font-weight:750}
+
+.download{width:100%;margin-top:12px;background:linear-gradient(135deg,var(--green),#26b586);color:#05140f}
+.progress{height:7px;background:#0a0f17;border-radius:99px;overflow:hidden;margin-top:12px}
+.progress i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--blue),var(--blue2));
+  transition:width .25s ease}
+.status{color:var(--muted);font-size:12.5px;margin-top:7px;min-height:18px;display:flex;justify-content:space-between}
+
+.skeleton{background:var(--panel-solid);border:1px solid var(--line);border-radius:15px;
+  padding:15px;margin-bottom:12px;overflow:hidden;position:relative}
+.skeleton::after{content:"";position:absolute;inset:0;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.06),transparent);
+  animation:shimmer 1.2s infinite}
+@keyframes shimmer{from{transform:translateX(-100%)}to{transform:translateX(100%)}}
+.bar{height:12px;border-radius:6px;background:rgba(255,255,255,.07)}
+.bar.w60{width:60%}.bar.w40{width:40%;margin-top:8px}
+
 @media(max-width:650px){
-  .wrap{padding:28px 14px 60px}
-  .brand{font-size:29px}
+  .wrap{padding:26px 14px 60px}
+  .brand{font-size:22px}
   .inputrow{flex-direction:column}
   .inputrow .btn{width:100%}
-  .frow{align-items:stretch;flex-direction:column}
-  .action{min-width:0}
+  .meta{flex-direction:row}
+  .thumb{width:96px;height:56px}
 }
 </style>
 </head>
 <body>
 <div class="wrap">
   <div class="header">
-    <div class="brand">MediaFlow PRO</div>
-    <div class="sub">Fast analysis • temporary processing • automatic cleanup</div>
+    <div class="logo">M</div>
+    <div>
+      <div class="brand">MediaFlow PRO</div>
+      <div class="sub">Fast analysis · temporary processing · automatic cleanup</div>
+    </div>
   </div>
 
   <div class="panel">
@@ -590,7 +745,8 @@ background:var(--blue);color:#07111e;white-space:nowrap}
       <button class="btn" id="go">Analyze</button>
     </div>
     <div class="msg" id="msg"></div>
-    <div class="note">Server-side cookies are configured automatically when <b>cookies.txt</b> is present in the project.</div>
+    <div class="meta" id="meta" style="display:none"></div>
+    <div class="note">Server-side cookies are used automatically when configured.</div>
   </div>
 
   <div id="out"></div>
@@ -603,12 +759,26 @@ const esc=x=>String(x??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&
 $('#go').onclick=analyze;
 $('#url').addEventListener('keydown',e=>{if(e.key==='Enter')analyze()});
 
+function skeletons(n){
+  const out=$('#out'); out.innerHTML='';
+  const title=document.createElement('div');
+  title.className='section-title'; title.textContent='Reading available formats…';
+  out.appendChild(title);
+  for(let i=0;i<n;i++){
+    const s=document.createElement('div');
+    s.className='skeleton';
+    s.innerHTML='<div class="bar w60"></div><div class="bar w40"></div>';
+    out.appendChild(s);
+  }
+}
+
 async function analyze(){
   const url=$('#url').value.trim();
   if(!url){$('#msg').textContent='Please paste a URL.';return}
   const btn=$('#go'); btn.disabled=true; btn.textContent='Analyzing…';
-  $('#msg').textContent='Analyzing URL and reading available formats…';
-  $('#out').innerHTML='';
+  $('#msg').textContent='Reading source and available formats…';
+  $('#meta').style.display='none';
+  skeletons(4);
 
   const fd=new FormData(); fd.append('url',url);
   try{
@@ -616,29 +786,51 @@ async function analyze(){
     const d=await r.json();
     if(!r.ok) throw Error(d.error||'Analysis failed');
 
-    $('#msg').textContent=d.title||'Available formats';
+    $('#msg').textContent=`Found ${d.formats.length} format${d.formats.length===1?'':'s'}`;
 
-    const title=document.createElement('div');
-    title.className='section-title';
-    title.textContent='Available Formats';
-    $('#out').appendChild(title);
+    if(d.title){
+      const meta=$('#meta');
+      meta.style.display='flex';
+      meta.innerHTML=`
+        ${d.thumbnail?`<img class="thumb" src="${esc(d.thumbnail)}" alt="">`:''}
+        <div class="meta-text">
+          <div class="meta-title">${esc(d.title)}</div>
+          <div class="meta-sub">${[d.uploader,d.duration].filter(Boolean).map(esc).join(' · ')}</div>
+        </div>`;
+    }
 
-    d.formats.forEach(f=>{
-      const card=document.createElement('div');
-      card.className='format';
-      card.innerHTML=`
-        <div class="frow">
-          <div class="info">
-            <div class="label">${esc(f.label)}</div>
-            <div class="detail">${esc(f.detail)} · <span class="size">${esc(f.size)}</span></div>
+    const out=$('#out'); out.innerHTML='';
+    const groups=[['video','Video'],['audio','Audio only']];
+    for(const [kind,label] of groups){
+      const items=d.formats.filter(f=>f.kind===kind);
+      if(!items.length) continue;
+      const title=document.createElement('div');
+      title.className='section-title';
+      title.textContent=label;
+      out.appendChild(title);
+      const grid=document.createElement('div');
+      grid.className='grid';
+      items.forEach((f,idx)=>{
+        const card=document.createElement('div');
+        card.className='format';
+        card.style.animationDelay=(idx*25)+'ms';
+        card.innerHTML=`
+          <div class="frow">
+            <div class="icon ${kind==='audio'?'audio':''}">${kind==='audio'?'♪':'▶'}</div>
+            <div class="info">
+              <div class="label">${esc(f.label)}</div>
+              <div class="detail">${esc(f.detail)} · <span class="size">${esc(f.size)}</span></div>
+            </div>
           </div>
-          <div class="action"><button class="btn download">Download</button></div>
-        </div>
-        `;
-      card.querySelector('button').onclick=()=>startDownload(f.token,card);
-      $('#out').appendChild(card);
-    });
+          <button class="btn download">Download</button>
+          `;
+        card.querySelector('button').onclick=()=>startDownload(f.token,card);
+        grid.appendChild(card);
+      });
+      out.appendChild(grid);
+    }
   }catch(e){
+    $('#out').innerHTML='';
     $('#msg').innerHTML='<span class="error">Error: '+esc(e.message)+'</span>';
   }finally{
     btn.disabled=false;btn.textContent='Analyze';
@@ -649,6 +841,15 @@ async function startDownload(token,card){
   const btn=card.querySelector('button');
   btn.disabled=true;
   btn.textContent='Preparing…';
+
+  let bar=card.querySelector('.progress');
+  if(!bar){
+    card.insertAdjacentHTML('beforeend','<div class="progress"><i></i></div><div class="status"><span class="s-left"></span><span class="s-right"></span></div>');
+    bar=card.querySelector('.progress');
+  }
+  const fill=bar.querySelector('i');
+  const sLeft=card.querySelector('.s-left');
+  const sRight=card.querySelector('.s-right');
 
   try{
     const start=await fetch('/api/start/'+encodeURIComponent(token),{method:'POST'});
@@ -672,6 +873,12 @@ async function startDownload(token,card){
           btn.textContent='Download';
           return;
         }
+
+        const p=d.progress||{};
+        if(fill) fill.style.width=(p.percent||0)+'%';
+        if(sLeft) sLeft.textContent=`${p.downloaded||''} / ${p.total||''}`;
+        if(sRight) sRight.textContent=p.speed?`${p.speed} · ETA ${p.eta}`:'';
+        btn.textContent=(p.percent||0)+'% …';
 
         if(d.status==='ready'){
           clearInterval(timer);
