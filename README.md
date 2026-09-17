@@ -15,3 +15,6 @@
 ## cookies.txt
 Place your real Netscape-format `cookies.txt` in the repository root if required.
 Do NOT expose it in frontend code or logs. For a public GitHub repository, use a private repo or preferably a Koyeb secret/mounted secret instead.
+
+## v7 fix
+The download concurrency slot is now released in a `finally` block after every successful or failed download, preventing the server from becoming permanently busy after the first job.

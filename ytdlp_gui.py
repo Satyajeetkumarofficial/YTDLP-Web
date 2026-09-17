@@ -427,6 +427,12 @@ def worker(job_id, fmt, workdir):
     except Exception as exc:
         job.update(status="error", error=str(exc))
         log.exception("DOWNLOAD failed job=%s", job_id)
+    finally:
+        try:
+            SEM.release()
+            log.info("DOWNLOAD SLOT RELEASED | job=%s", job_id)
+        except Exception:
+            log.exception("Failed to release download slot | job=%s", job_id)
 
 
 @app.post("/api/start/<token>")
@@ -458,7 +464,7 @@ def start_download(token):
             return jsonify(status="error", error=job.get("error"))
 
         if not SEM.acquire(blocking=False):
-            return jsonify(error="Server is busy. Try again shortly."), 503
+            return jsonify(error="All download slots are currently in use. Please try again in a few seconds."), 503
 
         workdir = tempfile.mkdtemp(prefix="mediaflow-", dir=TMP_ROOT)
         job["workdir"] = workdir
