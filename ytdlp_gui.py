@@ -15,6 +15,13 @@ from collections import defaultdict, deque
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify, render_template_string, send_file, abort, make_response
 import yt_dlp
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+log = logging.getLogger("mediaflow")
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 6 * 1024 * 1024
@@ -32,7 +39,7 @@ DOWNLOAD_SEM = threading.BoundedSemaphore(MAX_JOBS)
 MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_GB", "4")) * 1024**3
 MAX_FORMATS = 80
 JOB_TTL = 30 * 60
-RATE_LIMIT = 12
+RATE_LIMIT = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "30"))
 RATE_WINDOW = 60
 
 def client_ip():
@@ -98,6 +105,31 @@ def cleanup_old():
             if v.get("created", 0) < cutoff:
                 JOBS.pop(k, None)
 
+def log_format_summary(info, formats):
+    title = info.get("title") or "Unknown"
+    extractor = info.get("extractor_key") or info.get("extractor") or "unknown"
+    webpage = info.get("webpage_url") or ""
+    duration = info.get("duration")
+    uploader = info.get("uploader") or info.get("channel") or ""
+    log.info("ANALYSIS RESULT | extractor=%s | title=%s | uploader=%s | duration=%s | formats=%d | url=%s",
+             extractor, title[:180], uploader[:120], duration, len(formats), webpage[:300])
+    for x in formats:
+        log.info("FORMAT | kind=%s | label=%s | detail=%s | size=%s | selector=%s",
+                 x.get("kind"), x.get("label"), x.get("detail"),
+                 human_size(x.get("size")) if x.get("size") else "unavailable",
+                 x.get("format") or "")
+
+def human_size(n):
+    if not n:
+        return "Size unavailable"
+    n = float(n)
+    units = ["B", "KB", "MB", "GB", "TB"]
+    for u in units:
+        if n < 1024 or u == units[-1]:
+            return f"{n:.1f} {u}" if u != "B" else f"{int(n)} B"
+        n /= 1024
+    return "Size unavailable"
+
 def safe_filename(name):
     name = re.sub(r'[\\/:*?"<>|]+', "_", name or "download")
     return name[:180].strip(" .") or "download"
@@ -137,7 +169,8 @@ def build_formats(info):
             "label": f"{h}p • MP4",
             "detail": "Video + Audio" if has_audio else "Video + best audio",
             "format": f"bestvideo[height={h}]+bestaudio/best[height={h}]",
-            "container": "mp4"
+            "container": "mp4",
+            "size": srcf.get("filesize") or srcf.get("filesize_approx"),
         })
         result.append({
             "id": f"q:{h}:mkv",
@@ -145,7 +178,8 @@ def build_formats(info):
             "label": f"{h}p • MKV",
             "detail": "Video + Audio",
             "format": f"bestvideo[height={h}]+bestaudio/best[height={h}]",
-            "container": "mkv"
+            "container": "mkv",
+            "size": srcf.get("filesize") or srcf.get("filesize_approx"),
         })
         if ext == "webm":
             result.append({
@@ -154,7 +188,8 @@ def build_formats(info):
                 "label": f"{h}p • WebM",
                 "detail": "WebM stream",
                 "format": f"bestvideo[height={h}]+bestaudio/best[height={h}]",
-                "container": "webm"
+                "container": "webm",
+                "size": srcf.get("filesize") or srcf.get("filesize_approx"),
             })
 
     # Original audio options, de-duplicated by extension/quality.
@@ -172,7 +207,8 @@ def build_formats(info):
             "label": f"{ext.upper()} • {abr}kbps" if abr else ext.upper(),
             "detail": "Original audio",
             "format": str(f.get("format_id")),
-            "container": ext
+            "container": ext,
+            "size": f.get("filesize") or f.get("filesize_approx"),
         })
         if len(seen_audio) >= 10:
             break
@@ -194,7 +230,7 @@ PAGE = r"""
 .hero{text-align:center;margin:25px 0 24px}.hero h1{font-size:clamp(30px,6vw,54px);margin:0;letter-spacing:-2px}.hero p{color:var(--muted);margin:10px auto 26px;max-width:620px}
 .search{display:flex;gap:10px;background:#0d131d;border:1px solid var(--line);padding:9px;border-radius:18px;box-shadow:var(--shadow)}input{min-width:0;flex:1;background:#080d15;border:0;color:var(--txt);padding:15px;border-radius:12px;font-size:15px;outline:0}.primary{border:0;border-radius:12px;padding:0 24px;background:linear-gradient(135deg,var(--a),var(--b));color:#fff;font-weight:800;cursor:pointer}.primary:disabled{opacity:.55}
 #msg{min-height:42px;padding:15px 2px;color:var(--muted)}.title{font-size:18px;font-weight:800;margin:5px 0 13px}.section{margin-top:18px}.section h2{font-size:12px;color:var(--muted);letter-spacing:.13em;text-transform:uppercase;margin:0 0 10px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:10px}.card{background:linear-gradient(145deg,var(--surface),var(--surface2));border:1px solid var(--line);border-radius:15px;padding:13px;display:flex;align-items:center;justify-content:space-between;gap:12px;transition:.16s}.card:hover{transform:translateY(-1px);border-color:#385174}.info b{font-size:15px}.info small{display:block;color:var(--muted);margin-top:4px}.dl{border:1px solid #304768;background:#142238;color:#e9f1ff;border-radius:10px;padding:10px 13px;font-weight:800;cursor:pointer}.dl:hover{background:#1a2d48}.progress{height:5px;background:#0a0f17;border-radius:99px;margin-top:16px;overflow:hidden}.progress div{height:100%;width:0;background:linear-gradient(90deg,var(--a),var(--b));transition:width .2s}.status{font-size:12px;color:var(--muted);margin-top:8px}.foot{text-align:center;color:#657289;font-size:11px;margin-top:30px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:10px}.card{background:linear-gradient(145deg,var(--surface),var(--surface2));border:1px solid var(--line);border-radius:15px;padding:13px;display:flex;align-items:center;justify-content:space-between;gap:12px;transition:.16s}.card:hover{transform:translateY(-1px);border-color:#385174}.info b{font-size:15px}.info small{display:block;color:var(--muted);margin-top:4px}.info small:last-child{color:#a9bce0;font-size:11px}.dl{border:1px solid #304768;background:#142238;color:#e9f1ff;border-radius:10px;padding:10px 13px;font-weight:800;cursor:pointer}.dl:hover{background:#1a2d48}.progress{height:5px;background:#0a0f17;border-radius:99px;margin-top:16px;overflow:hidden}.progress div{height:100%;width:0;background:linear-gradient(90deg,var(--a),var(--b));transition:width .2s}.status{font-size:12px;color:var(--muted);margin-top:8px}.foot{text-align:center;color:#657289;font-size:11px;margin-top:30px}
 @media(max-width:620px){.top{margin-bottom:18px}.search{flex-direction:column}.primary{height:48px}.card{align-items:flex-start}.dl{padding:9px 10px}}
 </style></head>
 <body><main class="wrap">
@@ -221,7 +257,7 @@ function render(d){
  if(a.length)h+='<section class="section"><h2>🎵 Audio</h2><div class="grid">'+a.map(card).join('')+'</div></section>';
  $('results').innerHTML=h||'No formats found.';
 }
-function card(x){return `<div class="card"><div class="info"><b>${esc(x.label)}</b><small>${esc(x.detail)}</small></div><button class="dl" onclick="start('${x.token}')">Download</button></div>`}
+function card(x){return `<div class="card"><div class="info"><b>${esc(x.label)}</b><small>${esc(x.detail)}</small><small>📦 ${esc(x.size||"Size unavailable")}</small></div><button class="dl" onclick="start('${x.token}')">Download</button></div>`}
 async function start(token){
  const old=document.activeElement; if(old)old.disabled=true;
  const url='/download/'+encodeURIComponent(token);
@@ -247,6 +283,7 @@ def index():
 
 @app.get("/health")
 def health():
+    log.info("HEALTH check ip=%s", client_ip())
     return jsonify(ok=True, service="mediaflow-pro")
 
 @app.post("/api/formats")
@@ -256,27 +293,40 @@ def formats_api():
         return jsonify(error="Too many requests. Please wait a minute."),429
     data=request.get_json(silent=True) or {}
     url=(data.get("url") or "").strip()
+    log.info("ANALYZE request ip=%s url=%s", client_ip(), url[:180])
     if len(url)>4096 or not allowed_url(url):
         return jsonify(error="Invalid or blocked URL."),400
     try:
         opts={"quiet":True,"no_warnings":True,"skip_download":True,"noplaylist":True,
+              "js_runtimes":["deno"],
+              "impersonate":"chrome",
+              "socket_timeout":20,"retries":3,"extractor_retries":3,
+              "http_chunk_size":10485760,
+              "source_address":"0.0.0.0",
               "socket_timeout":20,"retries":2,"extractor_retries":2}
         with yt_dlp.YoutubeDL(opts) as ydl:
             info=ydl.extract_info(url,download=False)
         fs=build_formats(info)
+        log_format_summary(info, fs)
         if not fs:
+            log.warning("ANALYZE no formats ip=%s", client_ip())
             return jsonify(error="No downloadable formats found."),400
         jid=uuid.uuid4().hex
+        log.info("ANALYSIS COMPLETE | job=%s | title=%s | options=%d",
+                 jid, (info.get("title") or "Media")[:180], len(fs))
         with LOCK:
             JOBS[jid]={"url":url,"formats":{x["id"]:x for x in fs},
                        "title":info.get("title") or "Media","created":time.time()}
         response=[]
         for x in fs:
-            y={k:x[k] for k in ("kind","label","detail")}
+            y={k:x[k] for k in ("kind","label","detail","size")}
+            y["size"]=human_size(y["size"]) if y.get("size") else "Size unavailable"
             y["token"]=make_token(jid,x["id"])
             response.append(y)
+        log.info("ANALYSIS RESPONSE | job=%s | options=%d | client=%s", jid, len(response), client_ip())
         return jsonify(title=info.get("title") or "Media",formats=response)
     except Exception as e:
+        log.exception("ANALYZE failed ip=%s", client_ip())
         return jsonify(error=str(e)[:1000]),400
 
 @app.get("/download/<path:token>")
@@ -286,9 +336,13 @@ def download(token):
     jid,fid=verified
     with LOCK:
         job=JOBS.get(jid)
+    log.info("DOWNLOAD request ip=%s job=%s format=%s", client_ip(), jid, fid)
     if not job or time.time()-job["created"]>JOB_TTL: abort(404)
     fmt=job["formats"].get(fid)
     if not fmt: abort(404)
+    log.info("DOWNLOAD SELECTED | job=%s | label=%s | kind=%s | detail=%s | estimated_size=%s | client=%s",
+             jid, fmt.get("label"), fmt.get("kind"), fmt.get("detail"),
+             human_size(fmt.get("size")) if fmt.get("size") else "unavailable", client_ip())
 
     work=os.path.join(TMP_ROOT,uuid.uuid4().hex)
     os.makedirs(work,exist_ok=True)
@@ -302,10 +356,17 @@ def download(token):
             "format":fmt["format"],"outtmpl":out,"noplaylist":True,
             "quiet":True,"no_warnings":True,"retries":3,"fragment_retries":3,
             "concurrent_fragment_downloads":4,"socket_timeout":30,
+            "js_runtimes":["deno"],
+            "impersonate":"chrome",
+            "http_chunk_size":10485760,
+            "retry_sleep_functions":{"http": lambda n: min(10, 1.5 ** n)},
             "restrictfilenames":True,"max_filesize":MAX_FILE_BYTES,
             "merge_output_format":fmt["container"],
             "paths":{"home":work,"temp":work},
-            "nopart":False
+            "nopart":False,
+            # aria2c is a fallback/accelerator for direct HTTP/HTTPS downloads.
+            "external_downloader":"aria2c",
+            "external_downloader_args":{"aria2c":["-x","8","-s","8","-k","1M","--file-allocation=none"]},
         }
         with yt_dlp.YoutubeDL(opts) as ydl:
             info=ydl.extract_info(job["url"],download=True)
@@ -316,6 +377,9 @@ def download(token):
             raise RuntimeError("No output file was created.")
         # Prefer the largest completed media file.
         path=max(files,key=os.path.getsize)
+        actual_size=os.path.getsize(path)
+        log.info("DOWNLOAD ready job=%s file=%s size=%s", jid, os.path.basename(path), human_size(actual_size))
+        log.info("BROWSER response started job=%s", jid)
         ext=fmt["container"]
         base=safe_filename(info.get("title") or "download")
         filename=f"{base}.{ext}"
@@ -323,12 +387,14 @@ def download(token):
                        conditional=True,max_age=0)
         @resp.call_on_close
         def finish():
+            log.info("CLEANUP job=%s temporary_data=%s", jid, work)
             cleanup(work)
             DOWNLOAD_SEM.release()
             with LOCK:
                 JOBS.pop(jid,None)
         return resp
     except Exception as e:
+        log.exception("DOWNLOAD failed job=%s", jid)
         cleanup(work)
         DOWNLOAD_SEM.release()
         return jsonify(error=str(e)[:1500]),500
