@@ -16,6 +16,10 @@ from urllib.parse import urlparse
 from flask import Flask, request, jsonify, render_template_string, send_file, abort, make_response
 import yt_dlp
 import logging
+try:
+    from curl_cffi import requests as cf_requests
+except Exception:
+    cf_requests = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -149,86 +153,115 @@ def safe_filename(name):
     name = re.sub(r'[\\/:*?"<>|]+', "_", name or "download")
     return name[:180].strip(" .") or "download"
 
+def _fmt_size(f, duration=0):
+    size = f.get("filesize") or f.get("filesize_approx")
+    if size:
+        return int(size)
+    bitrate = f.get("tbr") or f.get("abr")
+    if duration and bitrate:
+        return int(float(duration) * float(bitrate) * 1000 / 8)
+    return None
+
 def build_formats(info):
     src = info.get("formats") or []
     videos, audios = [], []
     heights = set()
+    duration = info.get("duration") or 0
     for f in src:
         fid = str(f.get("format_id", ""))
         ext = (f.get("ext") or "").lower()
         h = int(f.get("height") or 0)
-        vc = f.get("vcodec")
-        ac = f.get("acodec")
+        vc, ac = f.get("vcodec"), f.get("acodec")
         if not fid:
             continue
         if vc and vc != "none":
-            if h > 0:
-                heights.add(h)
+            if h > 0: heights.add(h)
             videos.append((h, f))
         elif ac and ac != "none":
             audios.append(f)
 
-    # Quality presets: one clean button per actual available height.
-    result = []
+    result=[]
     for h in sorted(heights, reverse=True):
-        f = max((x for x in videos if x[0] == h), key=lambda z: (
-            1 if z[1].get("acodec") not in (None, "none") else 0,
-            float(z[1].get("tbr") or 0)
-        ))
-        srcf = f[1]
-        ext = srcf.get("ext") or "video"
-        has_audio = srcf.get("acodec") not in (None, "none")
-        result.append({
-            "id": f"q:{h}",
-            "kind": "video",
-            "label": f"{h}p • MP4",
-            "detail": "Video + Audio" if has_audio else "Video + best audio",
-            "format": f"bestvideo[height={h}]+bestaudio/best[height={h}]",
-            "container": "mp4",
-            "size": srcf.get("filesize") or srcf.get("filesize_approx"),
-        })
-        result.append({
-            "id": f"q:{h}:mkv",
-            "kind": "video",
-            "label": f"{h}p • MKV",
-            "detail": "Video + Audio",
-            "format": f"bestvideo[height={h}]+bestaudio/best[height={h}]",
-            "container": "mkv",
-            "size": srcf.get("filesize") or srcf.get("filesize_approx"),
-        })
-        if ext == "webm":
-            result.append({
-                "id": f"q:{h}:webm",
-                "kind": "video",
-                "label": f"{h}p • WebM",
-                "detail": "WebM stream",
-                "format": f"bestvideo[height={h}]+bestaudio/best[height={h}]",
-                "container": "webm",
-                "size": srcf.get("filesize") or srcf.get("filesize_approx"),
-            })
+        candidates=[x for x in videos if x[0]==h]
+        srcf=max(candidates,key=lambda z:(1 if z[1].get("acodec") not in (None,"none") else 0,float(z[1].get("tbr") or 0)))[1]
+        size=_fmt_size(srcf,duration)
+        # If video-only, also account for the best available audio stream.
+        if srcf.get("acodec") in (None,"none"):
+            audio_candidates=[a for a in audios if a.get("url")]
+            if audio_candidates:
+                best_audio=max(audio_candidates,key=lambda a:float(a.get("abr") or a.get("tbr") or 0))
+                a_size=_fmt_size(best_audio,duration)
+                if size and a_size: size += a_size
+                elif a_size: size=a_size
+        fmt=f"bestvideo[height={h}]+bestaudio/best[height={h}]"
+        common={"format":fmt,"size":size,"size_pending":False}
+        result.append({"id":f"q:{h}","kind":"video","label":f"{h}p • MP4","detail":"Video + Audio","container":"mp4",**common})
+        result.append({"id":f"q:{h}:mkv","kind":"video","label":f"{h}p • MKV","detail":"Video + Audio","container":"mkv",**common})
+        if (srcf.get("ext") or "").lower()=="webm":
+            result.append({"id":f"q:{h}:webm","kind":"video","label":f"{h}p • WebM","detail":"WebM stream","container":"webm",**common})
 
-    # Original audio options, de-duplicated by extension/quality.
-    seen_audio = set()
-    for f in sorted(audios, key=lambda x: float(x.get("abr") or 0), reverse=True):
-        ext = (f.get("ext") or "audio").lower()
-        abr = int(float(f.get("abr") or 0)) if f.get("abr") else 0
-        key = (ext, abr // 32)
-        if key in seen_audio:
-            continue
-        seen_audio.add(key)
-        result.append({
-            "id": f"a:{f.get('format_id')}",
-            "kind": "audio",
-            "label": f"{ext.upper()} • {abr}kbps" if abr else ext.upper(),
-            "detail": "Original audio",
-            "format": str(f.get("format_id")),
-            "container": ext,
-            "size": f.get("filesize") or f.get("filesize_approx"),
-        })
-        if len(seen_audio) >= 10:
-            break
-
+    seen=set()
+    for f in sorted(audios,key=lambda x:float(x.get("abr") or 0),reverse=True):
+        ext=(f.get("ext") or "audio").lower(); abr=int(float(f.get("abr") or 0)) if f.get("abr") else 0
+        key=(ext,abr//32)
+        if key in seen: continue
+        seen.add(key)
+        result.append({"id":f"a:{f.get('format_id')}","kind":"audio","label":f"{ext.upper()} • {abr}kbps" if abr else ext.upper(),"detail":"Original audio","format":str(f.get("format_id")),"container":ext,"size":_fmt_size(f,duration),"size_pending":False})
+        if len(seen)>=10: break
     return result[:MAX_FORMATS]
+
+def _probe_url_size(url, headers=None, timeout=8):
+    if not url: return None
+    try:
+        if cf_requests:
+            r=cf_requests.head(url,headers=headers or {},timeout=timeout,allow_redirects=True)
+            cl=r.headers.get("content-length")
+            if cl and cl.isdigit(): return int(cl)
+            cr=r.headers.get("content-range","")
+            if "/" in cr and cr.rsplit("/",1)[1].isdigit(): return int(cr.rsplit("/",1)[1])
+            r=cf_requests.get(url,headers={**(headers or {}),"Range":"bytes=0-0"},timeout=timeout,allow_redirects=True,stream=True)
+            cr=r.headers.get("content-range","")
+            if "/" in cr and cr.rsplit("/",1)[1].isdigit(): return int(cr.rsplit("/",1)[1])
+            cl=r.headers.get("content-length")
+            return int(cl) if cl and cl.isdigit() and r.status_code==200 else None
+        return None
+    except Exception:
+        return None
+
+def background_probe_sizes(job_id, info, cookie_path=None):
+    """Best-effort remote size probing. Never logs URLs/cookie contents."""
+    try:
+        raw=info.get("formats") or []
+        duration=info.get("duration") or 0
+        by_height={}
+        aud={}
+        for f in raw:
+            fid=str(f.get("format_id","")); h=int(f.get("height") or 0)
+            size=_fmt_size(f,duration)
+            if size is None and f.get("url"):
+                size=_probe_url_size(f.get("url"), f.get("http_headers") or {})
+            if f.get("vcodec") not in (None,"none") and h:
+                by_height.setdefault(h,[]).append((f,size))
+            elif f.get("acodec") not in (None,"none") and fid:
+                aud[fid]=size
+        with LOCK:
+            job=JOBS.get(job_id)
+            if not job: return
+            for x in job["formats"].values():
+                if x.get("kind")=="audio":
+                    if x.get("size") is None:
+                        x["size"]=aud.get(str(x.get("format")))
+                elif x.get("size") is None:
+                    h=int(x["id"].split(":")[1])
+                    candidates=by_height.get(h,[])
+                    if candidates:
+                        best=max(candidates,key=lambda z:float(z[0].get("tbr") or 0))
+                        x["size"]=best[1]
+            job["size_ready"]=True
+    except Exception:
+        log.exception("SIZE PROBE failed job=%s", job_id)
+        with LOCK:
+            if job_id in JOBS: JOBS[job_id]["size_ready"]=True
 
 PAGE = r"""
 <!doctype html>
@@ -254,7 +287,7 @@ PAGE = r"""
 <body><main class="wrap">
 <div class="top"><div class="logo">⚡ MediaFlow <i>PRO</i></div><div class="badge">Koyeb Ready</div></div>
 <section class="hero"><h1>Download Media. Your Way.</h1><p>Detect available qualities and audio streams, then choose exactly what you want. The browser receives the requested download.</p>
-<div class="search"><input id="url" placeholder="Paste a media URL…" autocomplete="off"><button id="go" class="primary" onclick="analyze()">Analyze</button></div></section>
+<div class="search"><input id="url" placeholder="Paste a media URL…" autocomplete="off"><button id="go" class="primary" onclick="analyze()">Analyze</button></div><div class="cookie-box"><div class="cookie-title">🍪 Optional cookie.txt</div><div class="cookie-help">Upload a Netscape-format cookie.txt only when the site requires your logged-in session.</div><input id="cookieFile" type="file" accept=".txt,text/plain"></div></section>
 <div id="msg"></div><div id="results"></div><div class="foot">Temporary processing only • No permanent download library</div>
 </main>
 <script>
@@ -262,12 +295,14 @@ const $=id=>document.getElementById(id);
 function esc(s){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 async function analyze(){
  let url=$('url').value.trim(); if(!url)return;
- $('go').disabled=true;$('go').textContent='Analyzing…';$('results').innerHTML='';$('msg').textContent='Checking available formats…';
- try{let r=await fetch('/api/formats',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
- let d=await r.json();if(!r.ok)throw Error(d.error||'Analysis failed');render(d)}
+ $('go').disabled=true;$('go').textContent='Analyzing…';$('results').innerHTML='';$('msg').textContent='🔎 Analyzing formats…';
+ try{let fd=new FormData();fd.append('url',url);let cf=$('cookieFile').files[0];if(cf)fd.append('cookie_file',cf);
+ let r=await fetch('/api/formats',{method:'POST',body:fd});let d=await r.json();if(!r.ok)throw Error(d.error||'Analysis failed');render(d);if(d.job&&!d.size_ready)pollSize(d.job)}
  catch(e){$('msg').textContent='❌ '+e.message}
  finally{$('go').disabled=false;$('go').textContent='Analyze'}
 }
+async function pollSize(job){for(let i=0;i<20;i++){await new Promise(r=>setTimeout(r,500));try{let r=await fetch('/api/formats/'+encodeURIComponent(job));if(!r.ok)return;let d=await r.json();if(d.formats)render(d);if(d.size_ready)return}catch(e){return}}}
+
 function render(d){
  $('msg').innerHTML='<div class="title">'+esc(d.title)+'</div>'+d.formats.length+' download options detected';
  let v=d.formats.filter(x=>x.kind==='video'),a=d.formats.filter(x=>x.kind==='audio'),h='';
@@ -307,44 +342,46 @@ def health():
 @app.post("/api/formats")
 def formats_api():
     cleanup_old()
-    if not limited():
-        return jsonify(error="Too many requests. Please wait a minute."),429
-    data=request.get_json(silent=True) or {}
+    if not limited(): return jsonify(error="Too many requests. Please wait a minute."),429
+    data=request.form or {}
     url=(data.get("url") or "").strip()
-    log.info("ANALYZE request ip=%s url=%s", client_ip(), url[:180])
-    if len(url)>4096 or not allowed_url(url):
-        return jsonify(error="Invalid or blocked URL."),400
+    cookie_upload=request.files.get("cookie_file")
+    log.info("ANALYZE request ip=%s url=%s",client_ip(),url[:180])
+    if len(url)>4096 or not allowed_url(url): return jsonify(error="Invalid or blocked URL."),400
+    analyze_tmp=tempfile.mkdtemp(prefix="mediaflow-analyze-")
+    cookie_path=None
     try:
-        opts={"quiet":True,"no_warnings":True,"skip_download":True,"noplaylist":True,
-              "js_runtimes":{"deno":{}},
-              "socket_timeout":20,"retries":3,"extractor_retries":3,
-              "http_chunk_size":10485760,
-              "source_address":"0.0.0.0",
-              "socket_timeout":20,"retries":2,"extractor_retries":2}
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info=ydl.extract_info(url,download=False)
-        fs=build_formats(info)
-        log_format_summary(info, fs)
-        if not fs:
-            log.warning("ANALYZE no formats ip=%s", client_ip())
-            return jsonify(error="No downloadable formats found."),400
+        if cookie_upload and cookie_upload.filename:
+            if not cookie_upload.filename.lower().endswith(".txt"): return jsonify(error="Please upload a .txt cookie file."),400
+            cookie_path=os.path.join(analyze_tmp,"cookie.txt");cookie_upload.save(cookie_path)
+            if not validate_cookie_file(cookie_path): return jsonify(error="Invalid Netscape-format cookie.txt."),400
+            log.info("ANALYZE cookie accepted ip=%s",client_ip())
+        opts={"quiet":True,"no_warnings":True,"skip_download":True,"noplaylist":True,"js_runtimes":{"deno":{}},"socket_timeout":20,"retries":3,"extractor_retries":3,"http_chunk_size":10485760}
+        if cookie_path: opts["cookiefile"]=cookie_path
+        with yt_dlp.YoutubeDL(opts) as ydl: info=ydl.extract_info(url,download=False)
+        fs=build_formats(info); log_format_summary(info,fs)
+        if not fs:return jsonify(error="No downloadable formats found."),400
         jid=uuid.uuid4().hex
-        log.info("ANALYSIS COMPLETE | job=%s | title=%s | options=%d",
-                 jid, (info.get("title") or "Media")[:180], len(fs))
         with LOCK:
-            JOBS[jid]={"url":url,"formats":{x["id"]:x for x in fs},
-                       "title":info.get("title") or "Media","created":time.time()}
+            JOBS[jid]={"url":url,"formats":{x["id"]:x for x in fs},"title":info.get("title") or "Media","created":time.time(),"size_ready":False,"cookie_text":Path(cookie_path).read_text(encoding="utf-8",errors="ignore") if cookie_path else None}
+        threading.Thread(target=background_probe_sizes,args=(jid,info),daemon=True).start()
         response=[]
         for x in fs:
-            y={k:x[k] for k in ("kind","label","detail","size")}
-            y["size"]=human_size(y["size"]) if y.get("size") else "Size unavailable"
-            y["token"]=make_token(jid,x["id"])
-            response.append(y)
-        log.info("ANALYSIS RESPONSE | job=%s | options=%d | client=%s", jid, len(response), client_ip())
-        return jsonify(title=info.get("title") or "Media",formats=response)
+            y={k:x[k] for k in ("kind","label","detail","size")};y["size"]=human_size(y["size"]) if y.get("size") else "Calculating…";y["token"]=make_token(jid,x["id"]);response.append(y)
+        log.info("ANALYSIS COMPLETE | job=%s | title=%s | options=%d",jid,(info.get("title") or "Media")[:180],len(fs))
+        return jsonify(title=info.get("title") or "Media",formats=response,job=jid,size_ready=False)
     except Exception as e:
-        log.exception("ANALYZE failed ip=%s", client_ip())
-        return jsonify(error=str(e)[:1000]),400
+        log.exception("ANALYZE failed ip=%s",client_ip());return jsonify(error=str(e)[:1000]),400
+    finally: cleanup(analyze_tmp)
+
+@app.get("/api/formats/<job_id>")
+def formats_status(job_id):
+    with LOCK: job=JOBS.get(job_id)
+    if not job or time.time()-job["created"]>JOB_TTL:return jsonify(error="Job expired."),404
+    response=[]
+    for x in job["formats"].values():
+        y={k:x[k] for k in ("kind","label","detail","size")};y["size"]=human_size(y["size"]) if y.get("size") else ("Calculating…" if not job.get("size_ready") else "Size unavailable");y["token"]=make_token(job_id,x["id"]);response.append(y)
+    return jsonify(title=job["title"],formats=response,size_ready=job.get("size_ready",False))
 
 @app.get("/download/<path:token>")
 def download(token):
@@ -363,6 +400,8 @@ def download(token):
 
     work=os.path.join(TMP_ROOT,uuid.uuid4().hex)
     os.makedirs(work,exist_ok=True)
+    if job.get("cookie_text"):
+        Path(os.path.join(work,"cookie.txt")).write_text(job["cookie_text"],encoding="utf-8")
     acquired=DOWNLOAD_SEM.acquire(timeout=2)
     if not acquired:
         cleanup(work)
@@ -371,6 +410,7 @@ def download(token):
         out=os.path.join(work,"%(title).180B [%(id)s].%(ext)s")
         opts={
             "format":fmt["format"],"outtmpl":out,"noplaylist":True,
+            **({"cookiefile": os.path.join(work,"cookie.txt")} if job.get("cookie_text") else {}),
             "quiet":True,"no_warnings":True,"retries":3,"fragment_retries":3,
             "concurrent_fragment_downloads":4,"socket_timeout":30,
             "js_runtimes":{"deno":{}},
