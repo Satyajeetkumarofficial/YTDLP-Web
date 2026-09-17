@@ -1,13 +1,17 @@
-# MediaFlow PRO — Koyeb Ready
+# MediaFlow PRO — Koyeb Ready v5
 
-- Analyze URL before download.
-- Shows available video/audio formats.
-- Size: yt-dlp metadata -> bitrate estimate -> tiny Range probe.
-- Koyeb uses only temporary processing storage.
-- Temporary files are deleted after browser response closes.
-- Stable HMAC download tokens fix the previous 404.
-- Progress endpoint shows percentage, bytes, speed and ETA.
-- cookies.txt upload supported; cookie contents are not logged.
-- One Gunicorn worker is intentional because jobs are in memory.
-- Set MEDIAFLOW_SECRET in Koyeb.
-- Exact size may remain unavailable when the origin hides total length.
+- Koyeb `$PORT` + `0.0.0.0`
+- FFmpeg + Deno
+- Server-side `cookies.txt` (no user upload UI)
+- Dynamic yt-dlp formats
+- Size: metadata -> tiny HTTP range probe -> bitrate estimate
+- Temporary processing only
+- Native browser download (no fetch/blob buffering)
+- Signed download tokens
+- Real-time percent / speed / ETA
+- Automatic cleanup after browser response
+- One Gunicorn worker so in-memory jobs/tokens remain consistent
+
+## cookies.txt
+Place your real Netscape-format `cookies.txt` in the repository root if required.
+Do NOT expose it in frontend code or logs. For a public GitHub repository, use a private repo or preferably a Koyeb secret/mounted secret instead.

@@ -3,10 +3,7 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    curl \
-    ca-certificates \
-    unzip \
+    ffmpeg curl ca-certificates unzip \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL https://deno.land/install.sh | sh
@@ -18,6 +15,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY ytdlp_gui.py .
+# Put your real Netscape-format cookies.txt in the same GitHub repository.
+# It is copied into the image only if your repository contains it.
+COPY cookies.txt* /app/
 
 EXPOSE 8000
 

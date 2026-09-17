@@ -1,0 +1,2 @@
+# Netscape HTTP Cookie File
+# Replace this placeholder with your real cookies.txt if your source requires login cookies.
