@@ -628,8 +628,7 @@ async function analyze(){
           </div>
           <div class="action"><button class="btn download">Download</button></div>
         </div>
-        <div class="progress"><i></i></div>
-        <div class="status"></div>`;
+        `;
       card.querySelector('button').onclick=()=>startDownload(f.token,card);
       $('#out').appendChild(card);
     });
@@ -641,46 +640,54 @@ async function analyze(){
 }
 
 async function startDownload(token,card){
-  const btn=card.querySelector('button'), bar=card.querySelector('i'), status=card.querySelector('.status');
-  btn.disabled=true; btn.textContent='Preparing…'; status.textContent='Starting…';
+  const btn=card.querySelector('button');
+  btn.disabled=true;
+  btn.textContent='Preparing…';
 
   try{
     const start=await fetch('/api/start/'+encodeURIComponent(token),{method:'POST'});
     const sd=await start.json();
     if(!start.ok) throw Error(sd.error||'Unable to start download');
-
     if(sd.status==='error') throw Error(sd.error||'Download failed');
+
+    if(sd.status==='ready'){
+      window.location.href=sd.download_url||('/download/'+encodeURIComponent(token));
+      return;
+    }
 
     const timer=setInterval(async()=>{
       try{
         const r=await fetch('/api/progress/'+encodeURIComponent(token),{cache:'no-store'});
         const d=await r.json();
-        if(!r.ok){clearInterval(timer);throw Error(d.error||'Progress expired')}
 
-        const p=d.progress||{};
-        bar.style.width=(p.percent||0)+'%';
-        status.textContent=(p.percent||0)+'% · '+(p.downloaded||'0 B')+' / '+(p.total||'unknown')+' · '+(p.speed||'—')+' · ETA '+(p.eta||'—');
+        if(!r.ok){
+          clearInterval(timer);
+          btn.disabled=false;
+          btn.textContent='Download';
+          return;
+        }
 
         if(d.status==='ready'){
           clearInterval(timer);
-          bar.style.width='100%';
-          status.textContent='Ready — starting browser download…';
           btn.textContent='Downloading…';
           window.location.href=d.download_url||('/download/'+encodeURIComponent(token));
         }else if(d.status==='error'){
           clearInterval(timer);
-          throw Error(d.error||'Download failed');
+          btn.disabled=false;
+          btn.textContent='Download';
+          alert(d.error||'Download failed');
         }
       }catch(e){
         clearInterval(timer);
-        status.innerHTML='<span class="error">Error: '+esc(e.message)+'</span>';
-        btn.disabled=false; btn.textContent='Download';
+        btn.disabled=false;
+        btn.textContent='Download';
       }
     },700);
 
   }catch(e){
-    status.innerHTML='<span class="error">Error: '+esc(e.message)+'</span>';
-    btn.disabled=false; btn.textContent='Download';
+    btn.disabled=false;
+    btn.textContent='Download';
+    alert(e.message||'Download failed');
   }
 }
 </script>

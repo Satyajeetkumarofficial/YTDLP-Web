@@ -8,7 +8,7 @@
 - Temporary processing only
 - Native browser download (no fetch/blob buffering)
 - Signed download tokens
-- Real-time percent / speed / ETA
+- Clean download UI; processing runs in the background until the native browser download starts
 - Automatic cleanup after browser response
 - One Gunicorn worker so in-memory jobs/tokens remain consistent
 
