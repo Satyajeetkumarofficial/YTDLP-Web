@@ -1,185 +1,337 @@
 #!/usr/bin/env python3
-import os, uuid, threading, tempfile, shutil, mimetypes
-from flask import Flask, request, jsonify, render_template_string, send_file, abort
+"""
+MediaFlow Pro — Koyeb-ready yt-dlp web downloader.
+
+Design:
+- Koyeb serves only the web app.
+- Downloads are temporary and are deleted after the response closes.
+- Dynamic formats are detected per URL.
+- Each option has its own browser Download button.
+- Includes basic abuse protection, signed one-time download tokens,
+  rate limiting, size limits, security headers and bounded concurrency.
+"""
+import os, re, uuid, time, hmac, hashlib, ipaddress, socket, tempfile, shutil, threading
+from collections import defaultdict, deque
+from urllib.parse import urlparse
+from flask import Flask, request, jsonify, render_template_string, send_file, abort, make_response
 import yt_dlp
 
 app = Flask(__name__)
-JOBS = {}
+app.config["MAX_CONTENT_LENGTH"] = 6 * 1024 * 1024
 
-# Temporary per-job data only. Nothing is kept permanently.
-TMP_ROOT = os.path.join(tempfile.gettempdir(), "ytdlp_koyeb")
+PORT = int(os.environ.get("PORT", "8000"))
+SECRET = os.environ.get("MEDIAFLOW_SECRET") or uuid.uuid4().hex + uuid.uuid4().hex
+TMP_ROOT = os.path.join(tempfile.gettempdir(), "mediaflow_pro")
 os.makedirs(TMP_ROOT, exist_ok=True)
+
+JOBS = {}
+LOCK = threading.Lock()
+RATE = defaultdict(deque)
+MAX_JOBS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "2"))
+DOWNLOAD_SEM = threading.BoundedSemaphore(MAX_JOBS)
+MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_GB", "4")) * 1024**3
+MAX_FORMATS = 80
+JOB_TTL = 30 * 60
+RATE_LIMIT = 12
+RATE_WINDOW = 60
+
+def client_ip():
+    # Do not trust arbitrary X-Forwarded-For headers for authorization.
+    return request.remote_addr or "unknown"
+
+def allowed_url(url):
+    try:
+        p = urlparse(url)
+        if p.scheme not in ("http", "https") or not p.hostname:
+            return False
+        host = p.hostname.strip(".").lower()
+        if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
+            return False
+        try:
+            infos = socket.getaddrinfo(host, None)
+            for item in infos:
+                ip = ipaddress.ip_address(item[4][0])
+                if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                    return False
+        except socket.gaierror:
+            return False
+        return True
+    except Exception:
+        return False
+
+def limited():
+    now = time.time()
+    q = RATE[client_ip()]
+    while q and now - q[0] > RATE_WINDOW:
+        q.popleft()
+    if len(q) >= RATE_LIMIT:
+        return False
+    q.append(now)
+    return True
+
+def sign(token):
+    return hmac.new(SECRET.encode(), token.encode(), hashlib.sha256).hexdigest()[:32]
+
+def make_token(job, fmt):
+    raw = f"{job}:{fmt}:{uuid.uuid4().hex}"
+    return raw + "." + sign(raw)
+
+def verify_token(token):
+    try:
+        raw, sig = token.rsplit(".", 1)
+        if not hmac.compare_digest(sig, sign(raw)):
+            return None
+        parts = raw.split(":")
+        if len(parts) < 3:
+            return None
+        return parts[0], parts[1]
+    except Exception:
+        return None
+
+def cleanup(path):
+    shutil.rmtree(path, ignore_errors=True)
+
+def cleanup_old():
+    cutoff = time.time() - JOB_TTL
+    with LOCK:
+        for k, v in list(JOBS.items()):
+            if v.get("created", 0) < cutoff:
+                JOBS.pop(k, None)
+
+def safe_filename(name):
+    name = re.sub(r'[\\/:*?"<>|]+', "_", name or "download")
+    return name[:180].strip(" .") or "download"
+
+def build_formats(info):
+    src = info.get("formats") or []
+    videos, audios = [], []
+    heights = set()
+    for f in src:
+        fid = str(f.get("format_id", ""))
+        ext = (f.get("ext") or "").lower()
+        h = int(f.get("height") or 0)
+        vc = f.get("vcodec")
+        ac = f.get("acodec")
+        if not fid:
+            continue
+        if vc and vc != "none":
+            if h > 0:
+                heights.add(h)
+            videos.append((h, f))
+        elif ac and ac != "none":
+            audios.append(f)
+
+    # Quality presets: one clean button per actual available height.
+    result = []
+    for h in sorted(heights, reverse=True):
+        f = max((x for x in videos if x[0] == h), key=lambda z: (
+            1 if z[1].get("acodec") not in (None, "none") else 0,
+            float(z[1].get("tbr") or 0)
+        ))
+        srcf = f[1]
+        ext = srcf.get("ext") or "video"
+        has_audio = srcf.get("acodec") not in (None, "none")
+        result.append({
+            "id": f"q:{h}",
+            "kind": "video",
+            "label": f"{h}p • MP4",
+            "detail": "Video + Audio" if has_audio else "Video + best audio",
+            "format": f"bestvideo[height={h}]+bestaudio/best[height={h}]",
+            "container": "mp4"
+        })
+        result.append({
+            "id": f"q:{h}:mkv",
+            "kind": "video",
+            "label": f"{h}p • MKV",
+            "detail": "Video + Audio",
+            "format": f"bestvideo[height={h}]+bestaudio/best[height={h}]",
+            "container": "mkv"
+        })
+        if ext == "webm":
+            result.append({
+                "id": f"q:{h}:webm",
+                "kind": "video",
+                "label": f"{h}p • WebM",
+                "detail": "WebM stream",
+                "format": f"bestvideo[height={h}]+bestaudio/best[height={h}]",
+                "container": "webm"
+            })
+
+    # Original audio options, de-duplicated by extension/quality.
+    seen_audio = set()
+    for f in sorted(audios, key=lambda x: float(x.get("abr") or 0), reverse=True):
+        ext = (f.get("ext") or "audio").lower()
+        abr = int(float(f.get("abr") or 0)) if f.get("abr") else 0
+        key = (ext, abr // 32)
+        if key in seen_audio:
+            continue
+        seen_audio.add(key)
+        result.append({
+            "id": f"a:{f.get('format_id')}",
+            "kind": "audio",
+            "label": f"{ext.upper()} • {abr}kbps" if abr else ext.upper(),
+            "detail": "Original audio",
+            "format": str(f.get("format_id")),
+            "container": ext
+        })
+        if len(seen_audio) >= 10:
+            break
+
+    return result[:MAX_FORMATS]
 
 PAGE = r"""
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MediaFlow — Multi-Site Downloader</title>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#080b12">
+<title>MediaFlow Pro</title>
 <style>
-:root{--bg:#070a10;--card:#101620;--card2:#0c1119;--line:#202a38;--text:#eef4ff;--muted:#8c9ab0;--accent:#6ea8fe;--accent2:#8b7cff;--ok:#55d187}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% 0,#17243b 0,transparent 38%),var(--bg);color:var(--text);font:15px Inter,system-ui,-apple-system,Segoe UI,sans-serif}
-.wrap{max-width:920px;margin:auto;padding:35px 18px 70px}.brand{font-size:28px;font-weight:800;letter-spacing:-.6px}.brand span{color:var(--accent)}
-.sub{color:var(--muted);margin:5px 0 28px}.search{background:rgba(16,22,32,.9);border:1px solid var(--line);padding:14px;border-radius:18px;display:flex;gap:10px;box-shadow:0 15px 45px #0006}
-input{flex:1;background:#080d14;border:1px solid var(--line);color:var(--text);padding:14px;border-radius:12px;outline:none;font-size:15px}.btn{border:0;border-radius:12px;padding:0 22px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:white;font-weight:800;cursor:pointer}.btn:disabled{opacity:.5}
-#msg{color:var(--muted);padding:14px 3px}.section{margin-top:24px}.section h2{font-size:14px;text-transform:uppercase;letter-spacing:.12em;color:var(--muted)}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:12px}.format{background:linear-gradient(145deg,var(--card),var(--card2));border:1px solid var(--line);border-radius:16px;padding:15px;display:flex;justify-content:space-between;gap:12px;align-items:center}.info b{display:block;font-size:16px}.info small{display:block;color:var(--muted);margin-top:4px}.download{background:#17263a;color:#dceaff;border:1px solid #29405e;border-radius:10px;padding:10px 13px;font-weight:700;cursor:pointer;white-space:nowrap}.download:hover{background:#203653}.note{margin-top:25px;color:#728097;font-size:12px;text-align:center}
-@media(max-width:600px){.search{flex-direction:column}.btn{height:48px}.format{align-items:flex-start}.download{padding:9px 10px}}
-</style>
-</head>
-<body><div class="wrap">
-<div class="brand">⚡ Media<span>Flow</span></div>
-<div class="sub">Fast multi-site media downloader · Browser download</div>
-<div class="search">
-<input id="url" placeholder="Paste a supported video, audio or media URL…" autocomplete="off">
-<button class="btn" id="analyze" onclick="analyze()">Analyze</button>
-</div>
-<div id="msg"></div><div id="results"></div>
-<div class="note">Files are processed temporarily for the requested download and cleaned up afterward.</div>
-</div>
+:root{--bg:#070a10;--surface:#0e141e;--surface2:#111a27;--line:#202c3d;--txt:#f3f7ff;--muted:#8e9bb0;--a:#6d9cff;--b:#8d6bff;--good:#53d28b;--danger:#ff6574;--shadow:0 25px 70px #0008}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(800px 420px at 50% -80px,#20325855,transparent 65%),var(--bg);color:var(--txt);font:15px Inter,system-ui,-apple-system,Segoe UI,sans-serif}
+.wrap{max-width:1000px;margin:auto;padding:28px 18px 70px}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:30px}
+.logo{font-weight:900;font-size:26px;letter-spacing:-.8px}.logo i{font-style:normal;color:#7fa7ff}.badge{font-size:11px;color:#aebbd0;border:1px solid var(--line);padding:6px 9px;border-radius:999px}
+.hero{text-align:center;margin:25px 0 24px}.hero h1{font-size:clamp(30px,6vw,54px);margin:0;letter-spacing:-2px}.hero p{color:var(--muted);margin:10px auto 26px;max-width:620px}
+.search{display:flex;gap:10px;background:#0d131d;border:1px solid var(--line);padding:9px;border-radius:18px;box-shadow:var(--shadow)}input{min-width:0;flex:1;background:#080d15;border:0;color:var(--txt);padding:15px;border-radius:12px;font-size:15px;outline:0}.primary{border:0;border-radius:12px;padding:0 24px;background:linear-gradient(135deg,var(--a),var(--b));color:#fff;font-weight:800;cursor:pointer}.primary:disabled{opacity:.55}
+#msg{min-height:42px;padding:15px 2px;color:var(--muted)}.title{font-size:18px;font-weight:800;margin:5px 0 13px}.section{margin-top:18px}.section h2{font-size:12px;color:var(--muted);letter-spacing:.13em;text-transform:uppercase;margin:0 0 10px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:10px}.card{background:linear-gradient(145deg,var(--surface),var(--surface2));border:1px solid var(--line);border-radius:15px;padding:13px;display:flex;align-items:center;justify-content:space-between;gap:12px;transition:.16s}.card:hover{transform:translateY(-1px);border-color:#385174}.info b{font-size:15px}.info small{display:block;color:var(--muted);margin-top:4px}.dl{border:1px solid #304768;background:#142238;color:#e9f1ff;border-radius:10px;padding:10px 13px;font-weight:800;cursor:pointer}.dl:hover{background:#1a2d48}.progress{height:5px;background:#0a0f17;border-radius:99px;margin-top:16px;overflow:hidden}.progress div{height:100%;width:0;background:linear-gradient(90deg,var(--a),var(--b));transition:width .2s}.status{font-size:12px;color:var(--muted);margin-top:8px}.foot{text-align:center;color:#657289;font-size:11px;margin-top:30px}
+@media(max-width:620px){.top{margin-bottom:18px}.search{flex-direction:column}.primary{height:48px}.card{align-items:flex-start}.dl{padding:9px 10px}}
+</style></head>
+<body><main class="wrap">
+<div class="top"><div class="logo">⚡ MediaFlow <i>PRO</i></div><div class="badge">Koyeb Ready</div></div>
+<section class="hero"><h1>Download Media. Your Way.</h1><p>Detect available qualities and audio streams, then choose exactly what you want. The browser receives the requested download.</p>
+<div class="search"><input id="url" placeholder="Paste a media URL…" autocomplete="off"><button id="go" class="primary" onclick="analyze()">Analyze</button></div></section>
+<div id="msg"></div><div id="results"></div><div class="foot">Temporary processing only • No permanent download library</div>
+</main>
 <script>
+const $=id=>document.getElementById(id);
+function esc(s){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 async function analyze(){
- const u=document.getElementById('url').value.trim(); if(!u)return;
- const b=document.getElementById('analyze'); b.disabled=true; b.textContent='Analyzing…';
- document.getElementById('results').innerHTML=''; document.getElementById('msg').textContent='Finding available formats…';
- try{
-  const r=await fetch('/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:u})});
-  const d=await r.json(); if(!r.ok) throw Error(d.error||'Could not analyze URL');
-  render(d);
- }catch(e){document.getElementById('msg').textContent='❌ '+e.message}
- finally{b.disabled=false;b.textContent='Analyze'}
+ let url=$('url').value.trim(); if(!url)return;
+ $('go').disabled=true;$('go').textContent='Analyzing…';$('results').innerHTML='';$('msg').textContent='Checking available formats…';
+ try{let r=await fetch('/api/formats',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})});
+ let d=await r.json();if(!r.ok)throw Error(d.error||'Analysis failed');render(d)}
+ catch(e){$('msg').textContent='❌ '+e.message}
+ finally{$('go').disabled=false;$('go').textContent='Analyze'}
 }
 function render(d){
- document.getElementById('msg').textContent=(d.title||'Media')+' — '+d.formats.length+' downloadable options';
- const v=d.formats.filter(x=>x.kind==='video'), a=d.formats.filter(x=>x.kind==='audio');
- let h='';
- if(v.length) h+='<div class="section"><h2>🎬 Video</h2><div class="grid">'+v.map(card).join('')+'</div></div>';
- if(a.length) h+='<div class="section"><h2>🎵 Audio</h2><div class="grid">'+a.map(card).join('')+'</div></div>';
- document.getElementById('results').innerHTML=h||'<div class="section">No downloadable formats found.</div>';
+ $('msg').innerHTML='<div class="title">'+esc(d.title)+'</div>'+d.formats.length+' download options detected';
+ let v=d.formats.filter(x=>x.kind==='video'),a=d.formats.filter(x=>x.kind==='audio'),h='';
+ if(v.length)h+='<section class="section"><h2>🎬 Video</h2><div class="grid">'+v.map(card).join('')+'</div></section>';
+ if(a.length)h+='<section class="section"><h2>🎵 Audio</h2><div class="grid">'+a.map(card).join('')+'</div></section>';
+ $('results').innerHTML=h||'No formats found.';
 }
-function esc(s){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
-function card(x){
- return `<div class="format"><div class="info"><b>${esc(x.label)}</b><small>${esc(x.detail)}</small></div><button class="download" onclick="download('${x.token}')">Download</button></div>`;
+function card(x){return `<div class="card"><div class="info"><b>${esc(x.label)}</b><small>${esc(x.detail)}</small></div><button class="dl" onclick="start('${x.token}')">Download</button></div>`}
+async function start(token){
+ const old=document.activeElement; if(old)old.disabled=true;
+ const url='/download/'+encodeURIComponent(token);
+ // Navigation is a normal browser download response, not a Koyeb-side saved library.
+ window.location.assign(url);
 }
-function download(t){ window.location.href='/download/'+encodeURIComponent(t); }
-document.getElementById('url').addEventListener('keydown',e=>{if(e.key==='Enter')analyze()});
-</script>
-</body></html>
+$('url').addEventListener('keydown',e=>{if(e.key==='Enter')analyze()});
+</script></body></html>
 """
 
-def cleanup(path):
-    try: shutil.rmtree(path, ignore_errors=True)
-    except Exception: pass
+@app.after_request
+def security(resp):
+    resp.headers["X-Content-Type-Options"]="nosniff"
+    resp.headers["X-Frame-Options"]="DENY"
+    resp.headers["Referrer-Policy"]="no-referrer"
+    resp.headers["Permissions-Policy"]="camera=(),microphone=(),geolocation=()"
+    resp.headers["Content-Security-Policy"]="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-ancestors 'none'"
+    return resp
 
-def format_options(info):
-    out=[]
-    seen=set()
-    # Combined formats: show common container/quality choices.
-    for f in info.get("formats", []):
-        fid=f.get("format_id")
-        if not fid or fid in seen: continue
-        ext=f.get("ext") or "file"
-        h=f.get("height")
-        vcodec=f.get("vcodec")
-        acodec=f.get("acodec")
-        if vcodec and vcodec != "none":
-            if h:
-                label=f"{h}p • {ext.upper()}"
-            else:
-                label=f"Video • {ext.upper()}"
-            if acodec and acodec != "none":
-                detail="Video + Audio"
-            else:
-                detail="Video only"
-            out.append({"fid":fid,"kind":"video","label":label,"detail":detail,
-                        "height":h or 0,"has_audio":bool(acodec and acodec!="none"),
-                        "ext":ext})
-        elif acodec and acodec != "none":
-            abr=f.get("abr")
-            label=f"{ext.upper()}"+(f" • {int(abr)}kbps" if abr else "")
-            out.append({"fid":fid,"kind":"audio","label":label,"detail":"Audio only",
-                        "height":0,"has_audio":True,"ext":ext})
-    # Prefer useful options and cap duplicate low-level formats.
-    videos=[x for x in out if x["kind"]=="video"]
-    audios=[x for x in out if x["kind"]=="audio"]
-    videos=sorted(videos,key=lambda x:(x["height"],x["has_audio"]),reverse=True)
-    selected=[]; heights=set()
-    for x in videos:
-        if x["height"] not in heights:
-            selected.append(x); heights.add(x["height"])
-    selected += audios[:12]
-    return selected
+@app.get("/")
+def index():
+    return render_template_string(PAGE)
 
-@app.route("/")
-def index(): return render_template_string(PAGE)
+@app.get("/health")
+def health():
+    return jsonify(ok=True, service="mediaflow-pro")
 
-@app.post("/analyze")
-def analyze():
+@app.post("/api/formats")
+def formats_api():
+    cleanup_old()
+    if not limited():
+        return jsonify(error="Too many requests. Please wait a minute."),429
     data=request.get_json(silent=True) or {}
     url=(data.get("url") or "").strip()
-    if not url: return jsonify(error="URL is required"),400
+    if len(url)>4096 or not allowed_url(url):
+        return jsonify(error="Invalid or blocked URL."),400
     try:
-        opts={"quiet":True,"no_warnings":True,"skip_download":True,"noplaylist":True}
+        opts={"quiet":True,"no_warnings":True,"skip_download":True,"noplaylist":True,
+              "socket_timeout":20,"retries":2,"extractor_retries":2}
         with yt_dlp.YoutubeDL(opts) as ydl:
             info=ydl.extract_info(url,download=False)
-        formats=format_options(info)
-        token=str(uuid.uuid4())
-        JOBS[token]={"url":url,"formats":formats}
-        # Remove old jobs opportunistically.
-        if len(JOBS)>100:
-            for k in list(JOBS)[:30]: JOBS.pop(k,None)
-        return jsonify(title=info.get("title","Media"),formats=[
-            {k:x[k] for k in ("kind","label","detail")}|{"token":token+":"+x["fid"]}
-            for x in formats
-        ])
+        fs=build_formats(info)
+        if not fs:
+            return jsonify(error="No downloadable formats found."),400
+        jid=uuid.uuid4().hex
+        with LOCK:
+            JOBS[jid]={"url":url,"formats":{x["id"]:x for x in fs},
+                       "title":info.get("title") or "Media","created":time.time()}
+        response=[]
+        for x in fs:
+            y={k:x[k] for k in ("kind","label","detail")}
+            y["token"]=make_token(jid,x["id"])
+            response.append(y)
+        return jsonify(title=info.get("title") or "Media",formats=response)
     except Exception as e:
-        return jsonify(error=str(e)),400
+        return jsonify(error=str(e)[:1000]),400
 
-@app.get("/download/<path:key>")
-def download(key):
-    try:
-        token,fid=key.split(":",1)
-        job=JOBS.get(token)
-        if not job: abort(404)
-        fmt=next(x for x in job["formats"] if x["fid"]==fid)
-    except Exception: abort(404)
+@app.get("/download/<path:token>")
+def download(token):
+    verified=verify_token(token)
+    if not verified: abort(404)
+    jid,fid=verified
+    with LOCK:
+        job=JOBS.get(jid)
+    if not job or time.time()-job["created"]>JOB_TTL: abort(404)
+    fmt=job["formats"].get(fid)
+    if not fmt: abort(404)
 
-    work=os.path.join(TMP_ROOT,str(uuid.uuid4()))
+    work=os.path.join(TMP_ROOT,uuid.uuid4().hex)
     os.makedirs(work,exist_ok=True)
+    acquired=DOWNLOAD_SEM.acquire(timeout=2)
+    if not acquired:
+        cleanup(work)
+        return jsonify(error="Server is busy. Please try again shortly."),429
     try:
-        # Prefer requested exact format; for video-only formats, merge best audio.
-        if fmt["kind"]=="video":
-            selector=fid if fmt["has_audio"] else f"{fid}+bestaudio/best"
-        else:
-            selector=fid
+        out=os.path.join(work,"%(title).180B [%(id)s].%(ext)s")
         opts={
-            "format":selector,
-            "outtmpl":os.path.join(work,"%(title)s [%(id)s].%(ext)s"),
-            "noplaylist":True,"quiet":True,"no_warnings":True,
-            "restrictfilenames":True,"merge_output_format":fmt["ext"]
+            "format":fmt["format"],"outtmpl":out,"noplaylist":True,
+            "quiet":True,"no_warnings":True,"retries":3,"fragment_retries":3,
+            "concurrent_fragment_downloads":4,"socket_timeout":30,
+            "restrictfilenames":True,"max_filesize":MAX_FILE_BYTES,
+            "merge_output_format":fmt["container"],
+            "paths":{"home":work,"temp":work},
+            "nopart":False
         }
         with yt_dlp.YoutubeDL(opts) as ydl:
             info=ydl.extract_info(job["url"],download=True)
-            path=ydl.prepare_filename(info)
-        # Merging can change extension.
-        candidates=[os.path.join(work,x) for x in os.listdir(work)]
-        if not os.path.exists(path):
-            if candidates: path=max(candidates,key=os.path.getsize)
-            else: raise RuntimeError("Downloaded file was not created")
-        name=os.path.basename(path)
-        response=send_file(path,as_attachment=True,download_name=name)
-        @response.call_on_close
-        def remove_temp():
+            requested=ydl.prepare_filename(info)
+        files=[os.path.join(work,n) for n in os.listdir(work)
+               if os.path.isfile(os.path.join(work,n)) and not n.endswith((".part",".ytdl"))]
+        if not files:
+            raise RuntimeError("No output file was created.")
+        # Prefer the largest completed media file.
+        path=max(files,key=os.path.getsize)
+        ext=fmt["container"]
+        base=safe_filename(info.get("title") or "download")
+        filename=f"{base}.{ext}"
+        resp=send_file(path,as_attachment=True,download_name=filename,
+                       conditional=True,max_age=0)
+        @resp.call_on_close
+        def finish():
             cleanup(work)
-        return response
+            DOWNLOAD_SEM.release()
+            with LOCK:
+                JOBS.pop(jid,None)
+        return resp
     except Exception as e:
         cleanup(work)
-        return jsonify(error=str(e)),500
-
-@app.get("/health")
-def health(): return "OK",200
+        DOWNLOAD_SEM.release()
+        return jsonify(error=str(e)[:1500]),500
 
 if __name__=="__main__":
-    port=int(os.environ.get("PORT","8000"))
-    app.run(host="0.0.0.0",port=port,debug=False)
+    app.run(host="0.0.0.0",port=PORT,debug=False,threaded=True)
