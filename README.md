@@ -68,3 +68,10 @@ This build adds:
 - native yt-dlp handling remains available for HLS/DASH and other extractor-managed streams
 
 The official yt-dlp documentation currently recommends FFmpeg/FFprobe, yt-dlp-ejs and a supported JS runtime; Deno is the recommended runtime. See the project documentation before changing runtime versions.
+
+
+### yt-dlp compatibility
+This build does not force a global `impersonate` target through the Python API.
+Modern yt-dlp versions can reject a plain string target in `YoutubeDL(...)`.
+`curl-cffi` remains installed so yt-dlp can use browser impersonation where an
+extractor/request requires it.
