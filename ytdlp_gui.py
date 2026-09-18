@@ -564,6 +564,9 @@ def make_formats(info):
             "selector": audio["format_id"],
             "source_format_id": audio["format_id"],
             "audio_format_id": None,
+            "audio_abr": audio.get("abr"),
+            "audio_asr": audio.get("asr"),
+            "audio_codec": audio.get("acodec"),
             "width": None,
             "height": None,
             "container": ext,
@@ -733,7 +736,13 @@ def stream(token):
             with yt_dlp.YoutubeDL(opts) as ydl:
                 fresh = ydl.extract_info(job["url"], download=False)
 
-            fresh_formats = [f for f in (fresh.get("formats") or []) if isinstance(f, dict) and f.get("format_id")]
+            fresh_formats = [
+                f for f in (fresh.get("formats") or [])
+                if isinstance(f, dict) and f.get("format_id") and f.get("url")
+            ]
+            if not fresh_formats:
+                raise RuntimeError("No real playable formats are available right now.")
+
             if fmt.get("kind") == "audio":
                 wanted_video = ""
                 wanted_audio = str(fmt.get("source_format_id") or "")
@@ -742,50 +751,103 @@ def stream(token):
                 wanted_audio = str(fmt.get("audio_format_id") or "")
 
             def find_format(fid):
+                if not fid:
+                    return None
                 return next((f for f in fresh_formats if str(f.get("format_id")) == fid), None)
 
             selected_video = find_format(wanted_video) if wanted_video else None
             selected_audio = find_format(wanted_audio) if wanted_audio else None
 
-            # If an ID disappeared between analysis and download, choose a
-            # fresh format with the same basic media characteristics rather
-            # than returning yt-dlp's confusing "Requested format is not
-            # available" error. Never invent a format ID.
+            # YouTube can rotate/rewrite format IDs between analysis and the
+            # actual download. Never fail merely because an old ID disappeared.
+            # Match the user's requested media characteristics against the
+            # fresh, playable list instead.
             if not selected_video and wanted_video:
                 old_h = fmt.get("height")
                 old_w = fmt.get("width")
-                candidates = [f for f in fresh_formats if f.get("vcodec") not in (None, "none")]
+                candidates = [
+                    f for f in fresh_formats
+                    if f.get("vcodec") not in (None, "none") and f.get("url")
+                ]
                 if old_h:
-                    same = [f for f in candidates if f.get("height") == old_h]
-                    if same:
-                        candidates = same
+                    same_h = [f for f in candidates if f.get("height") == old_h]
+                    if same_h:
+                        candidates = same_h
                 if old_w:
-                    same = [f for f in candidates if f.get("width") == old_w]
-                    if same:
-                        candidates = same
-                candidates.sort(key=lambda f: (f.get("fps") or 0, f.get("tbr") or 0), reverse=True)
+                    same_w = [f for f in candidates if f.get("width") == old_w]
+                    if same_w:
+                        candidates = same_w
+                # Prefer the closest resolution, then quality. This avoids
+                # silently jumping to an unrelated resolution.
+                target_h = int(old_h or 0)
+                candidates.sort(key=lambda f: (
+                    abs(int(f.get("height") or 0) - target_h),
+                    -(float(f.get("tbr") or 0)),
+                    -(float(f.get("fps") or 0)),
+                ))
                 selected_video = candidates[0] if candidates else None
 
             if wanted_audio and not selected_audio:
-                candidates = [f for f in fresh_formats if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")]
-                candidates.sort(key=lambda f: (f.get("abr") or 0, f.get("asr") or 0), reverse=True)
+                old_abr = float(fmt.get("audio_abr") or 0)
+                old_asr = int(fmt.get("audio_asr") or 0)
+                old_codec = str(fmt.get("audio_codec") or "").split(".")[0]
+                candidates = [
+                    f for f in fresh_formats
+                    if f.get("acodec") not in (None, "none") and
+                       f.get("vcodec") in (None, "none") and f.get("url")
+                ]
+                if old_codec:
+                    same_codec = [
+                        f for f in candidates
+                        if str(f.get("acodec") or "").split(".")[0] == old_codec
+                    ]
+                    if same_codec:
+                        candidates = same_codec
+                # Match the closest bitrate/sample-rate, preferring higher
+                # quality when equally close. No invented/fake format IDs.
+                candidates.sort(key=lambda f: (
+                    abs(float(f.get("abr") or 0) - old_abr),
+                    abs(int(f.get("asr") or 0) - old_asr),
+                    -(float(f.get("abr") or 0)),
+                ))
                 selected_audio = candidates[0] if candidates else None
 
-            if wanted_video and not selected_video:
-                raise RuntimeError("The selected video format is no longer available. Please analyze the URL again.")
-
-            ids = [selected_video.get("format_id")] if selected_video else []
-            if wanted_audio:
+            if fmt.get("kind") == "audio":
                 if not selected_audio:
-                    raise RuntimeError("The selected audio format is no longer available. Please analyze the URL again.")
-                ids.append(selected_audio.get("format_id"))
+                    raise RuntimeError("No real playable audio format is available right now. Please analyze again.")
+                info = dict(selected_audio)
+                info["requested_formats"] = [dict(selected_audio)]
+            else:
+                if not selected_video:
+                    raise RuntimeError("No real playable video format is available right now. Please analyze again.")
 
-            selector = "+".join(str(x) for x in ids if x)
-            if not selector:
-                raise RuntimeError("No valid media format was selected.")
-            opts["format"] = selector
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(job["url"], download=False)
+                # Use the fresh resolved URLs directly instead of passing a
+                # stale/new selector through a second yt-dlp extraction. This
+                # removes the race that produced "Requested format is not
+                # available" between the fresh format list and selector use.
+                needs_audio = selected_video.get("acodec") in (None, "none")
+                if needs_audio:
+                    if not selected_audio:
+                        # Always choose a fresh audio-only stream for video-only
+                        # formats. If the selected audio ID vanished, pick the
+                        # best currently playable audio rather than failing.
+                        candidates = [
+                            f for f in fresh_formats
+                            if f.get("acodec") not in (None, "none") and
+                               f.get("vcodec") in (None, "none") and f.get("url")
+                        ]
+                        candidates.sort(key=lambda f: (
+                            -(float(f.get("abr") or 0)),
+                            -(int(f.get("asr") or 0)),
+                        ))
+                        selected_audio = candidates[0] if candidates else None
+                    if not selected_audio:
+                        raise RuntimeError("No real playable audio stream is available for this video.")
+                    info = dict(selected_video)
+                    info["requested_formats"] = [dict(selected_video), dict(selected_audio)]
+                else:
+                    info = dict(selected_video)
+                    info["requested_formats"] = [dict(selected_video)]
     except Exception as exc:
         release_once()
         log.exception("STREAM resolve failed")

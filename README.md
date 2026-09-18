@@ -27,3 +27,7 @@ This build includes yt-dlp's default EJS dependencies and the bgutil PO-token pr
 
 ## v14 YouTube PO Token provider
 YouTube PO tokens now use the local bgutil HTTP provider on `127.0.0.1:4416` instead of spawning the Deno generation script for each yt-dlp extraction. This avoids the per-call script startup timeout seen on Koyeb. The provider remains internal to the container and is not exposed publicly.
+
+## V16
+- Download now uses fresh resolved playable URLs directly, avoiding stale YouTube format-ID selector races.
+- If an analyzed audio/video ID changes, the server matches a real fresh format by media characteristics instead of returning a stale-ID error.
