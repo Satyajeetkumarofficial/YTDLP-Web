@@ -3,6 +3,7 @@ from pathlib import Path
 from urllib.parse import urlparse, quote
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify, render_template_string, Response, stream_with_context
+from werkzeug.middleware.proxy_fix import ProxyFix
 import yt_dlp
 
 try:
@@ -10,7 +11,15 @@ try:
 except ImportError:
     requests = None
 
+try:
+    import curl_cffi  # noqa: F401
+    CURL_CFFI_AVAILABLE = True
+except ImportError:
+    CURL_CFFI_AVAILABLE = False
+
 app = Flask(__name__)
+# Koyeb sits behind a proxy; preserve the real client IP for rate limiting.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)
 PORT = int(os.getenv("PORT", "8000"))
 SECRET = os.getenv("MEDIAFLOW_SECRET") or uuid.uuid4().hex + uuid.uuid4().hex
 JOB_TTL = int(os.getenv("JOB_TTL", "1800"))
@@ -175,10 +184,10 @@ def resolve_size(fmt, duration):
     for key in ("filesize", "filesize_approx"):
         if fmt.get(key):
             return int(fmt[key]), True
-    estimate = bitrate_estimate(fmt, duration)
     probed = tiny_probe(fmt.get("url"))
     if probed is not None:
         return probed, True
+    estimate = bitrate_estimate(fmt, duration)
     if estimate is not None:
         return estimate, False
     return None, False
@@ -189,6 +198,124 @@ def size_label(bytes_, exact):
         return "Size unavailable"
     return hs(bytes_) if exact else "≈ " + hs(bytes_)
 
+
+
+
+def ydl_options(cookiefile=None, impersonate=None, skip_download=True):
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": skip_download,
+        "noplaylist": True,
+        "retries": 4,
+        "fragment_retries": 4,
+        "socket_timeout": 25,
+        "js_runtimes": {"deno": {}},
+    }
+    if cookiefile:
+        opts["cookiefile"] = cookiefile
+    if impersonate and CURL_CFFI_AVAILABLE:
+        opts["impersonate"] = impersonate
+    return opts
+
+
+def extract_with_fallback(url, base_opts=None):
+    """Normal yt-dlp first; browser impersonation only as a fallback.
+    Global impersonation is intentionally avoided because it can reduce
+    stability/speed on sites that don't need it.
+    """
+    opts = dict(base_opts or {})
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False), "normal"
+    except Exception as first_exc:
+        if not CURL_CFFI_AVAILABLE:
+            raise
+        retry = dict(opts)
+        retry["impersonate"] = "chrome"
+        log.warning("YTDLP RETRY | reason=%s | mode=chrome-impersonation", str(first_exc)[:240])
+        with yt_dlp.YoutubeDL(retry) as ydl:
+            return ydl.extract_info(url, download=False), "impersonated"
+
+
+def _abs_media_url(page_url, value):
+    from urllib.parse import urljoin
+    value = (value or "").strip().replace("\\/", "/")
+    if not value:
+        return None
+    return urljoin(page_url, value)
+
+
+def generic_media_fallback(page_url, cookiefile=None):
+    """Lightweight fallback for generic pages that embed a direct MP4/HLS URL.
+    This is intentionally conservative: it only exposes media URLs that are
+    already present in the page, JSON-LD, OpenGraph, or common player markup.
+    """
+    if not requests:
+        return []
+    headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    cookies = None
+    try:
+        if cookiefile:
+            from http.cookiejar import MozillaCookieJar
+            jar = MozillaCookieJar(cookiefile)
+            jar.load(ignore_discard=True, ignore_expires=True)
+            cookies = jar
+    except Exception:
+        cookies = None
+    try:
+        if CURL_CFFI_AVAILABLE:
+            import curl_cffi.requests as c_requests
+            r = c_requests.get(page_url, headers=headers, cookies=cookies, timeout=20, allow_redirects=True, impersonate="chrome")
+        else:
+            r = requests.get(page_url, headers=headers, cookies=cookies, timeout=20, allow_redirects=True)
+        html = r.text
+        final_url = r.url
+        r.close()
+    except Exception as exc:
+        log.warning("GENERIC FALLBACK failed | url=%s | error=%s", page_url, str(exc)[:240])
+        return []
+
+    candidates=[]
+    patterns=[
+        r'<meta[^>]+property=["\']og:video(?::secure_url)?["\'][^>]+content=["\']([^"\']+)',
+        r'<meta[^>]+name=["\']twitter:player:stream["\'][^>]+content=["\']([^"\']+)',
+        r'<video[^>]+src=["\']([^"\']+)',
+        r'<source[^>]+src=["\']([^"\']+)',
+        r'(?:(?:https?:)?//[^"\'\\s<>]+\.(?:mp4|m4v|webm)(?:\?[^"\'\\s<>]*)?)',
+        r'(?:(?:https?:)?//[^"\'\\s<>]+\.m3u8(?:\?[^"\'\\s<>]*)?)',
+    ]
+    for pat in patterns:
+        for m in re.finditer(pat, html, re.I):
+            val=m.group(1) if m.lastindex else m.group(0)
+            u=_abs_media_url(final_url,val)
+            if u: candidates.append(u)
+
+    seen=set(); out=[]
+    for u in candidates:
+        if u in seen: continue
+        seen.add(u)
+        low=u.lower()
+        if '.m3u8' in low:
+            proto='m3u8'
+            ext='mp4'
+        elif re.search(r'\.(?:mp4|m4v)(?:\?|$)',low):
+            proto='https'; ext='mp4'
+        elif '.webm' in low:
+            proto='https'; ext='webm'
+        else:
+            continue
+        out.append({
+            "kind":"video", "label":f"Direct • {ext.upper()}",
+            "detail":"Embedded media", "size":"Size unavailable", "size_bytes":None,
+            "selector":"__direct__", "container":ext, "direct_url":u,
+            "protocol":proto, "http_headers":headers,
+        })
+        if len(out)>=12: break
+    return out
 
 def reslabel(fmt):
     w, h = fmt.get("width"), fmt.get("height")
@@ -320,20 +447,16 @@ def analyze():
     t0 = time.time()
 
     try:
-        opts = {
-            "quiet": True, "no_warnings": True, "skip_download": True,
-            "noplaylist": True, "retries": 3, "fragment_retries": 3,
-            "socket_timeout": 20, "js_runtimes": {"deno": {}},
-        }
-        if cp:
-            opts["cookiefile"] = cp
-
+        opts = ydl_options(cp)
         log.info("ANALYZE request ip=%s url=%s", client_ip(), url)
 
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-
+        info, mode = extract_with_fallback(url, opts)
         formats = make_formats(info)
+        if not formats:
+            fallback = generic_media_fallback(url, cp)
+            if fallback:
+                formats = fallback
+                log.info("GENERIC FALLBACK RESULT | url=%s | formats=%d", url, len(formats))
         JOBS[job_id] = {"created": time.time(), "url": url, "title": info.get("title") or url, "formats": formats}
 
         log.info(
@@ -347,6 +470,10 @@ def analyze():
             item.pop("selector", None)
             item.pop("size_bytes", None)
             result.append(item)
+
+        if not formats:
+            log.warning("NO FORMATS | extractor=%s | url=%s", info.get("extractor"), url)
+            return jsonify(error="No downloadable media formats were found for this URL. The site may require a login, block server requests, or may not currently be supported by yt-dlp."), 422
 
         return jsonify(
             job_id=job_id, title=JOBS[job_id]["title"], thumbnail=info.get("thumbnail"),
@@ -400,20 +527,18 @@ def stream(token):
 
     try:
         cp = cookie_path()
-        opts = {
-            "quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
-            "format": fmt["selector"], "socket_timeout": 20, "js_runtimes": {"deno": {}},
-        }
-        if cp:
-            opts["cookiefile"] = cp
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(job["url"], download=False)
+        if fmt.get("direct_url"):
+            requested = [fmt]
+            info = {"title": job["title"]}
+        else:
+            opts = ydl_options(cp)
+            opts["format"] = fmt["selector"]
+            info, mode = extract_with_fallback(job["url"], opts)
+            requested = info.get("requested_formats") or [info]
     except Exception as exc:
         release_once()
         log.exception("STREAM resolve failed")
         return f"Could not resolve the stream: {exc}", 502
-
-    requested = info.get("requested_formats") or [info]
     filename = safe(f"{info.get('title') or job['title']}.{fmt['container']}")
     log.info("STREAM START | label=%s | parts=%d | file=%s", fmt["label"], len(requested), filename)
 
@@ -456,6 +581,33 @@ def stream(token):
         return resp
 
     src = requested[0]
+    if src.get("direct_url") and src.get("protocol") == "m3u8":
+        args = ["ffmpeg", "-loglevel", "error"]
+        hb = header_block(src)
+        if hb:
+            args += ["-headers", hb]
+        args += ["-i", src["direct_url"], "-c", "copy", "-movflags", "frag_keyframe+empty_moov+faststart", "-f", "mp4", "pipe:1"]
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        filename = safe(f"{job['title']}.mp4")
+
+        def generate_hls():
+            try:
+                while True:
+                    chunk = proc.stdout.read(CHUNK)
+                    if not chunk:
+                        break
+                    yield chunk
+            except GeneratorExit:
+                pass
+            finally:
+                try: proc.kill()
+                except Exception: pass
+                release_once()
+                log.info("STREAM END | file=%s", filename)
+        resp = Response(stream_with_context(generate_hls()), mimetype="video/mp4")
+        resp.headers["Content-Disposition"] = content_disposition(filename)
+        return resp
+
     headers = dict(src.get("http_headers") or {})
     range_header = request.headers.get("Range")
     if range_header:
