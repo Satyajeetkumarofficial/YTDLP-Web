@@ -18,3 +18,8 @@ No downloader can guarantee every site. Anti-bot, DRM, login requirements, geo r
 
 ## Cookies
 Put a Netscape-format `cookies.txt` in the project if a site needs authenticated cookies. Keep the repository private when cookies are real credentials.
+
+## v9 fixes
+- Correct yt-dlp generic Chrome impersonation extractor args; no invalid top-level `impersonate` API usage.
+- Same-token download requests are de-duplicated.
+- Existing download slot release behavior retained.
