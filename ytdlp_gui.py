@@ -61,8 +61,8 @@ def content_disposition(filename):
     (common on Facebook/Instagram captions) will make the server reject the
     response outright. Send a plain-ASCII fallback plus an RFC 5987
     UTF-8 filename* so browsers still show the real name."""
-    ascii_name = safe(name.encode("ascii", "ignore").decode("ascii")) or "download"
-    encoded = quote(name, safe="")
+    ascii_name = safe(filename.encode("ascii", "ignore").decode("ascii")) or "download"
+    encoded = quote(filename, safe="")
     return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded}'
 
 
