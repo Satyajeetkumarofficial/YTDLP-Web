@@ -335,30 +335,73 @@ def extract_with_fallback(url, opts):
 
 
 def make_formats(info):
+    """Build as many useful downloadable formats as the extractor exposes.
+
+    Generic fallbacks may return a single direct_url without a format_id; keep
+    that format intact instead of sending it through the normal yt-dlp format
+    grouping logic.
+    """
+    if info.get("direct_url") or any(f.get("direct_url") for f in (info.get("formats") or []) if isinstance(f, dict)):
+        direct_items = []
+        source_formats = info.get("formats") or [info]
+        for raw in source_formats:
+            if not isinstance(raw, dict) or not raw.get("direct_url"):
+                continue
+            u = raw.get("direct_url")
+            ext = (raw.get("container") or raw.get("ext") or ("webm" if ".webm" in u.lower() else "mp4")).lower()
+            label = raw.get("label") or ("Direct • " + ext.upper())
+            size = raw.get("size") or size_label(raw.get("size_bytes"), True if raw.get("size_bytes") else False)
+            direct_items.append({
+                "kind": raw.get("kind") or "video",
+                "label": label,
+                "detail": raw.get("detail") or "Direct media",
+                "size": size,
+                "size_bytes": raw.get("size_bytes"),
+                "selector": None,
+                "container": ext,
+                "url": u,
+                "direct_url": u,
+                "http_headers": raw.get("http_headers") or {},
+            })
+        if direct_items:
+            return direct_items[:40]
+
     duration = info.get("duration")
     videos, audios = [], []
 
     for raw in info.get("formats") or []:
-        if not raw.get("format_id"):
+        if not isinstance(raw, dict) or not raw.get("format_id"):
             continue
         if raw.get("vcodec") not in (None, "none"):
             videos.append(raw)
         elif raw.get("acodec") not in (None, "none"):
             audios.append(raw)
 
-    audios.sort(key=lambda x: x.get("abr") or 0, reverse=True)
+    audios.sort(key=lambda x: (x.get("abr") or 0, x.get("asr") or 0), reverse=True)
     best_audio = audios[0] if audios else None
 
-    videos.sort(key=lambda x: (x.get("height") or 0, x.get("width") or 0, x.get("tbr") or 0), reverse=True)
+    videos.sort(key=lambda x: (
+        x.get("height") or 0, x.get("width") or 0, x.get("fps") or 0,
+        x.get("tbr") or 0, x.get("vbr") or 0
+    ), reverse=True)
+
+    # Keep distinct useful encodes instead of collapsing everything to one
+    # format per resolution. This exposes more of what yt-dlp actually found.
     deduped_videos, seen = [], set()
     for video in videos:
-        key = (video.get("width"), video.get("height"))
+        key = (
+            video.get("width"), video.get("height"), video.get("fps"),
+            video.get("ext"), video.get("vcodec"), video.get("acodec"),
+            round(float(video.get("tbr") or 0), 1),
+        )
         if key in seen:
             continue
         seen.add(key)
         deduped_videos.append(video)
 
-    top_audios = audios[:8]
+    # Keep a healthy number of audio choices as well; the UI is capped below
+    # so unusually large extractor responses do not become unwieldy.
+    top_audios = audios[:20]
 
     to_size = list(deduped_videos) + list(top_audios)
     if best_audio is not None and best_audio not in to_size:
@@ -384,10 +427,16 @@ def make_formats(info):
 
         container = pick_container(video, best_audio)
         selector = video["format_id"] + (f"+{best_audio['format_id']}" if best_audio else "")
+        detail_parts = ["Video"]
+        if video.get("fps"):
+            detail_parts.append(f"{int(video['fps'])}fps")
+        if video.get("vcodec") and video.get("vcodec") != "none":
+            detail_parts.append(str(video["vcodec"]).split(".")[0])
+        detail_parts.append("+ best audio" if best_audio else "only")
         out.append({
             "kind": "video",
             "label": f"{reslabel(video)} • {container.upper()}",
-            "detail": "Video + best audio",
+            "detail": " • ".join(detail_parts),
             "size": size_label(total_bytes, total_exact),
             "size_bytes": total_bytes,
             "selector": selector,
@@ -398,17 +447,18 @@ def make_formats(info):
         ext = (audio.get("ext") or "m4a").lower()
         abr = audio.get("abr")
         abytes, aexact = sizes.get(id(audio), (None, False))
+        codec = str(audio.get("acodec") or "audio").split(".")[0]
         out.append({
             "kind": "audio",
             "label": f"{ext.upper()} • {int(abr) if abr else '?'} kbps",
-            "detail": "Original audio",
+            "detail": f"Original audio • {codec}",
             "size": size_label(abytes, aexact),
             "size_bytes": abytes,
             "selector": audio["format_id"],
             "container": ext,
         })
 
-    return out[:40]
+    return out[:80]
 
 
 @app.after_request
@@ -521,7 +571,16 @@ def stream(token):
     except (ValueError, TypeError, KeyError, IndexError):
         return "Format not found", 404
 
+    # Prevent accidental double-clicks / duplicate browser requests for the
+    # same signed format token. The flag is cleared when the stream ends.
+    with LOCK:
+        if job.get("stream_active"):
+            return "This download is already starting. Please wait.", 409
+        job["stream_active"] = True
+
     if not SEM.acquire(blocking=False):
+        with LOCK:
+            job["stream_active"] = False
         return "Server is busy streaming other downloads. Please try again shortly.", 503
 
     released = threading.Event()
@@ -529,6 +588,8 @@ def stream(token):
     def release_once():
         if not released.is_set():
             released.set()
+            with LOCK:
+                job["stream_active"] = False
             try:
                 SEM.release()
             except Exception:
@@ -598,6 +659,39 @@ def stream(token):
 
     src = requested[0]
     headers = dict(src.get("http_headers") or {})
+
+    # A generic fallback can discover an HLS playlist directly. Do not send
+    # the .m3u8 text to the browser; let FFmpeg consume it and pipe MP4.
+    src_url = src.get("url") or ""
+    if ".m3u8" in src_url.lower():
+        args = ["ffmpeg", "-loglevel", "error"]
+        hb = header_block(src)
+        if hb:
+            args += ["-headers", hb]
+        args += ["-i", src_url, "-c", "copy", "-movflags", "frag_keyframe+empty_moov+faststart", "-f", "mp4", "pipe:1"]
+        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+        def generate_hls():
+            try:
+                while True:
+                    chunk = proc.stdout.read(CHUNK)
+                    if not chunk:
+                        break
+                    yield chunk
+            except GeneratorExit:
+                pass
+            finally:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                release_once()
+                log.info("STREAM END | file=%s", filename)
+
+        resp = Response(stream_with_context(generate_hls()), mimetype="video/mp4")
+        resp.headers["Content-Disposition"] = content_disposition(filename)
+        return resp
+
     range_header = request.headers.get("Range")
     if range_header:
         headers["Range"] = range_header
