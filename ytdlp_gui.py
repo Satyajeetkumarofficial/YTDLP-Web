@@ -221,6 +221,47 @@ def pick_container(video, audio):
     return "mkv"
 
 
+
+def validate_media_url(fmt, timeout=6):
+    """Reject obvious HTML/image/placeholder sources and 0/1-second video stubs.
+
+    This is intentionally a lightweight ffprobe check: it validates the actual
+    media URL yt-dlp exposed without downloading the file. If probing fails for
+    a legitimate protected source, keep it rather than hiding a usable format.
+    """
+    url = (fmt.get("url") or fmt.get("direct_url") or "").strip()
+    if not url or not url.startswith(("http://", "https://")):
+        return False
+    ext = (fmt.get("ext") or "").lower()
+    if ext in {"jpg", "jpeg", "png", "gif", "webp", "svg"}:
+        return False
+    args = ["ffprobe", "-v", "error", "-rw_timeout", "6000000"]
+    headers = fmt.get("http_headers") or {}
+    if headers:
+        hb = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+        args += ["-headers", hb]
+    args += ["-select_streams", "v:0", "-show_entries",
+             "stream=codec_type:format=duration", "-of", "json", url]
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        if p.returncode != 0:
+            return True  # Do not hide sources that need a browser/session to probe.
+        data = json.loads(p.stdout or "{}")
+        streams = data.get("streams") or []
+        if not streams:
+            return False
+        dur = (data.get("format") or {}).get("duration")
+        if dur is not None:
+            try:
+                # A genuine page video should not be a 0/1-second placeholder.
+                if float(dur) < 2.0:
+                    return False
+            except (TypeError, ValueError):
+                pass
+        return True
+    except Exception:
+        return True
+
 def generic_http_get(url, timeout=15):
     """Browser-like generic fetch for pages that yt-dlp cannot extract."""
     headers = {
@@ -384,6 +425,22 @@ def make_formats(info):
         x.get("height") or 0, x.get("width") or 0, x.get("fps") or 0,
         x.get("tbr") or 0, x.get("vbr") or 0
     ), reverse=True)
+
+    # Validate the actual media URLs before exposing them. Some HTML5 players
+    # publish preview/placeholder files that yt-dlp can technically see but
+    # that contain only a blank frame or ~1 second of video. Keep genuine
+    # formats and leave protected/unprobeable sources visible.
+    if videos:
+        validated = []
+        futures_v = {id(v): PROBE_POOL.submit(validate_media_url, v) for v in videos[:40]}
+        for video in videos:
+            try:
+                ok = futures_v[id(video)].result(timeout=PROBE_TIMEOUT + 3) if id(video) in futures_v else True
+            except Exception:
+                ok = True
+            if ok:
+                validated.append(video)
+        videos = validated or videos
 
     # Keep distinct useful encodes instead of collapsing everything to one
     # format per resolution. This exposes more of what yt-dlp actually found.
