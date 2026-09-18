@@ -370,8 +370,8 @@ def extract_with_fallback(url, opts):
         # use the provider with the mweb/web clients instead of pretending a
         # page-level URL is a playable format.
         pot_args = {
-            'youtubepot-bgutilscript': {
-                'server_home': ['/opt/bgutil-ytdlp-pot-provider/server']
+            'youtubepot-bgutilhttp': {
+                'base_url': 'http://127.0.0.1:4416'
             },
         }
         for clients in (
@@ -707,7 +707,7 @@ def stream(token):
             if (urlparse(job["url"]).hostname or "").lower().endswith(("youtube.com", "youtu.be")):
                 opts["extractor_args"] = {
                     "youtube": {"player_client": ["mweb", "web_safari"]},
-                    "youtubepot-bgutilscript": {"server_home": ["/opt/bgutil-ytdlp-pot-provider/server"]},
+                    "youtubepot-bgutilhttp": {"base_url": "http://127.0.0.1:4416"},
                 }
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(job["url"], download=False)
