@@ -222,7 +222,7 @@ def pick_container(video, audio):
 
 
 
-def validate_media_url(fmt, timeout=6):
+def validate_media_url(fmt, timeout=6, strict=False):
     """Reject obvious HTML/image/placeholder sources and 0/1-second video stubs.
 
     This is intentionally a lightweight ffprobe check: it validates the actual
@@ -260,7 +260,7 @@ def validate_media_url(fmt, timeout=6):
                 pass
         return True
     except Exception:
-        return True
+        return False if strict else True
 
 def generic_http_get(url, timeout=15):
     """Browser-like generic fetch for pages that yt-dlp cannot extract."""
@@ -332,47 +332,78 @@ def generic_fallback(url):
     if not urls:
         return None
 
-    direct = urls[0]
-    ext = 'mp4'
-    if '.webm' in direct.lower(): ext = 'webm'
-    elif '.m3u8' in direct.lower(): ext = 'mp4'
-    fmt = {
-        'kind': 'video', 'label': 'Direct • ' + ext.upper(),
-        'detail': 'Direct media', 'size': 'Size unavailable', 'size_bytes': None,
-        'selector': None, 'container': ext, 'url': direct, 'direct_url': direct,
-        'http_headers': {'Referer': page_url},
-    }
-    size, exact = resolve_size(fmt, None)
-    fmt['size_bytes'] = size
-    fmt['size'] = size_label(size, exact)
-    return {'title': title or page_url, 'duration': None, 'formats': [fmt], 'extractor': 'generic'}
+    direct_formats = []
+    seen_urls = set()
+    for direct in urls:
+        if direct in seen_urls:
+            continue
+        seen_urls.add(direct)
+        ext = 'mp4'
+        if '.webm' in direct.lower(): ext = 'webm'
+        elif '.m3u8' in direct.lower(): ext = 'mp4'
+        fmt = {
+            'kind': 'video', 'label': 'Direct • ' + ext.upper(),
+            'detail': 'Verified direct media', 'size': 'Size unavailable', 'size_bytes': None,
+            'selector': None, 'container': ext, 'url': direct, 'direct_url': direct,
+            'http_headers': {'Referer': page_url},
+        }
+        # Generic HTML candidates are accepted only after a strict media probe.
+        if not validate_media_url(fmt, timeout=8, strict=True):
+            continue
+        size, exact = resolve_size(fmt, None)
+        fmt['size_bytes'] = size
+        fmt['size'] = size_label(size, exact)
+        direct_formats.append(fmt)
+    if not direct_formats:
+        return None
+    return {'title': title or page_url, 'duration': None, 'formats': direct_formats, 'extractor': 'generic'}
 
 
 def extract_with_fallback(url, opts):
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-        if info and (info.get('formats') or info.get('url')):
-            return info, 'normal'
-    except Exception as exc:
-        log.warning('YTDLP RETRY | reason=%s | mode=chrome-impersonation', exc)
+    # First try the normal extractor with yt-dlp's own format availability
+    # checks. This prevents placeholder/expired formats from being exposed.
+    attempts = [(dict(opts), 'normal')]
+    host = (urlparse(url).hostname or '').lower()
+    if host.endswith('youtube.com') or host.endswith('youtu.be'):
+        # YouTube currently has multiple client paths. Try them separately so
+        # a temporary failure in one client does not collapse the whole result
+        # to the generic HTML fallback. PO-token-protected formats may still be
+        # unavailable; those should simply not be advertised.
+        for clients in (
+            ['web_safari', 'web_embedded', 'mweb'],
+            ['web', 'web_safari', 'tv'],
+            ['android_vr', 'web_embedded'],
+        ):
+            o = dict(opts)
+            o['extractor_args'] = {'youtube': {'player_client': clients}}
+            attempts.append((o, 'youtube-client=' + ','.join(clients)))
+    else:
         retry = dict(opts)
-        # Do not use the invalid top-level `impersonate` Python option. yt-dlp's
-        # generic extractor accepts impersonation through extractor_args.
         retry['extractor_args'] = {'generic': {'impersonate': ['chrome']}}
+        attempts.append((retry, 'chrome-impersonation'))
+
+    last_exc = None
+    for attempt_opts, mode in attempts:
         try:
-            with yt_dlp.YoutubeDL(retry) as ydl:
+            with yt_dlp.YoutubeDL(attempt_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
             if info and (info.get('formats') or info.get('url')):
-                return info, 'chrome-impersonation'
-        except Exception as retry_exc:
-            log.warning('YTDLP IMPERSONATION FAILED | error=%s', retry_exc)
+                return info, mode
+        except Exception as exc:
+            last_exc = exc
+            log.warning('YTDLP RETRY | reason=%s | mode=%s', exc, mode)
+
+    # Never use generic HTML scraping as a fallback for YouTube. A page-level
+    # URL or thumbnail can otherwise look like a media URL and create a fake
+    # one-format result.
+    if host.endswith('youtube.com') or host.endswith('youtu.be'):
+        raise RuntimeError('YouTube extraction failed. The current YouTube client may require a PO Token, login/cookies, or may be temporarily unavailable.') from last_exc
 
     generic = generic_fallback(url)
     if generic:
         log.info('GENERIC FALLBACK RESULT | url=%s | formats=%d', url, len(generic.get('formats') or []))
         return generic, 'generic'
-    raise RuntimeError('Unable to extract media from this URL. The site may require a browser challenge, login, DRM, or an unsupported extractor.')
+    raise RuntimeError('Unable to extract verified media from this URL. The site may require a browser challenge, login, DRM, or an unsupported extractor.') from last_exc
 
 
 def make_formats(info):
@@ -440,7 +471,7 @@ def make_formats(info):
                 ok = True
             if ok:
                 validated.append(video)
-        videos = validated or videos
+        videos = validated
 
     # Keep distinct useful encodes instead of collapsing everything to one
     # format per resolution. This exposes more of what yt-dlp actually found.
@@ -555,6 +586,7 @@ def analyze():
             "quiet": True, "no_warnings": True, "skip_download": True,
             "noplaylist": True, "retries": 3, "fragment_retries": 3,
             "socket_timeout": 20, "js_runtimes": {"deno": {}},
+            "check_all_formats": True,
         }
         if cp:
             opts["cookiefile"] = cp
