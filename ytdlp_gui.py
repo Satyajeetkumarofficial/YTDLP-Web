@@ -522,13 +522,20 @@ def make_formats(info):
             total_exact = vexact and audio_size[1]
 
         container = pick_container(video, best_audio)
-        selector = video["format_id"] + (f"+{best_audio['format_id']}" if best_audio else "")
+        # Remember the exact source IDs from analysis.  The YouTube format
+        # list can change between analysis and the later download request,
+        # so stream() re-resolves the page and rebuilds a selector from these
+        # IDs instead of blindly sending a stale combined selector.
+        video_id = video["format_id"]
+        needs_audio = video.get("acodec") in (None, "none")
+        audio_id = best_audio["format_id"] if (needs_audio and best_audio) else None
+        selector = video_id + (f"+{audio_id}" if audio_id else "")
         detail_parts = ["Video"]
         if video.get("fps"):
             detail_parts.append(f"{int(video['fps'])}fps")
         if video.get("vcodec") and video.get("vcodec") != "none":
             detail_parts.append(str(video["vcodec"]).split(".")[0])
-        detail_parts.append("+ best audio" if best_audio else "only")
+        detail_parts.append("+ best audio" if audio_id else ("with audio" if video.get("acodec") not in (None, "none") else "only"))
         out.append({
             "kind": "video",
             "label": f"{reslabel(video)} • {container.upper()}",
@@ -536,6 +543,10 @@ def make_formats(info):
             "size": size_label(total_bytes, total_exact),
             "size_bytes": total_bytes,
             "selector": selector,
+            "source_format_id": video_id,
+            "audio_format_id": audio_id,
+            "width": video.get("width"),
+            "height": video.get("height"),
             "container": container,
         })
 
@@ -551,6 +562,10 @@ def make_formats(info):
             "size": size_label(abytes, aexact),
             "size_bytes": abytes,
             "selector": audio["format_id"],
+            "source_format_id": audio["format_id"],
+            "audio_format_id": None,
+            "width": None,
+            "height": None,
             "container": ext,
         })
 
@@ -700,15 +715,75 @@ def stream(token):
             cp = cookie_path()
             opts = {
                 "quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
-                "format": fmt["selector"], "socket_timeout": 20, "js_runtimes": {"deno": {}}, "remote_components": ["ejs:npm"],
+                "socket_timeout": 20, "js_runtimes": {"deno": {}}, "remote_components": ["ejs:npm"],
             }
             if cp:
                 opts["cookiefile"] = cp
-            if (urlparse(job["url"]).hostname or "").lower().endswith(("youtube.com", "youtu.be")):
+            is_youtube = (urlparse(job["url"]).hostname or "").lower().endswith(("youtube.com", "youtu.be"))
+            if is_youtube:
                 opts["extractor_args"] = {
                     "youtube": {"player_client": ["mweb", "web_safari"]},
                     "youtubepot-bgutilhttp": {"base_url": "http://127.0.0.1:4416"},
                 }
+
+            # IMPORTANT: do not pass the selector generated during the earlier
+            # analysis to yt-dlp. YouTube can expose a different set of format
+            # IDs a few seconds later. First resolve a fresh, real format list,
+            # then select the requested source ID(s) from that fresh list.
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                fresh = ydl.extract_info(job["url"], download=False)
+
+            fresh_formats = [f for f in (fresh.get("formats") or []) if isinstance(f, dict) and f.get("format_id")]
+            if fmt.get("kind") == "audio":
+                wanted_video = ""
+                wanted_audio = str(fmt.get("source_format_id") or "")
+            else:
+                wanted_video = str(fmt.get("source_format_id") or "")
+                wanted_audio = str(fmt.get("audio_format_id") or "")
+
+            def find_format(fid):
+                return next((f for f in fresh_formats if str(f.get("format_id")) == fid), None)
+
+            selected_video = find_format(wanted_video) if wanted_video else None
+            selected_audio = find_format(wanted_audio) if wanted_audio else None
+
+            # If an ID disappeared between analysis and download, choose a
+            # fresh format with the same basic media characteristics rather
+            # than returning yt-dlp's confusing "Requested format is not
+            # available" error. Never invent a format ID.
+            if not selected_video and wanted_video:
+                old_h = fmt.get("height")
+                old_w = fmt.get("width")
+                candidates = [f for f in fresh_formats if f.get("vcodec") not in (None, "none")]
+                if old_h:
+                    same = [f for f in candidates if f.get("height") == old_h]
+                    if same:
+                        candidates = same
+                if old_w:
+                    same = [f for f in candidates if f.get("width") == old_w]
+                    if same:
+                        candidates = same
+                candidates.sort(key=lambda f: (f.get("fps") or 0, f.get("tbr") or 0), reverse=True)
+                selected_video = candidates[0] if candidates else None
+
+            if wanted_audio and not selected_audio:
+                candidates = [f for f in fresh_formats if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")]
+                candidates.sort(key=lambda f: (f.get("abr") or 0, f.get("asr") or 0), reverse=True)
+                selected_audio = candidates[0] if candidates else None
+
+            if wanted_video and not selected_video:
+                raise RuntimeError("The selected video format is no longer available. Please analyze the URL again.")
+
+            ids = [selected_video.get("format_id")] if selected_video else []
+            if wanted_audio:
+                if not selected_audio:
+                    raise RuntimeError("The selected audio format is no longer available. Please analyze the URL again.")
+                ids.append(selected_audio.get("format_id"))
+
+            selector = "+".join(str(x) for x in ids if x)
+            if not selector:
+                raise RuntimeError("No valid media format was selected.")
+            opts["format"] = selector
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(job["url"], download=False)
     except Exception as exc:
