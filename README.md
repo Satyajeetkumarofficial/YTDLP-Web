@@ -18,3 +18,8 @@ Do NOT expose it in frontend code or logs. For a public GitHub repository, use a
 
 ## v7 fix
 The download concurrency slot is now released in a `finally` block after every successful or failed download, preventing the server from becoming permanently busy after the first job.
+
+
+### v13 YouTube support
+
+This build includes yt-dlp's default EJS dependencies and the bgutil PO-token provider. YouTube still may restrict some videos, clients, or accounts, but the application no longer creates a generic fake format when YouTube extraction fails.

@@ -365,18 +365,26 @@ def extract_with_fallback(url, opts):
     attempts = [(dict(opts), 'normal')]
     host = (urlparse(url).hostname or '').lower()
     if host.endswith('youtube.com') or host.endswith('youtu.be'):
-        # YouTube currently has multiple client paths. Try them separately so
-        # a temporary failure in one client does not collapse the whole result
-        # to the generic HTML fallback. PO-token-protected formats may still be
-        # unavailable; those should simply not be advertised.
+        # YouTube currently uses PO-token protected GVS/SABR paths for some
+        # clients. v13 installs the bgutil PO-token provider and EJS support;
+        # use the provider with the mweb/web clients instead of pretending a
+        # page-level URL is a playable format.
+        pot_args = {
+            'youtubepot-bgutilscript': {
+                'server_home': ['/opt/bgutil-ytdlp-pot-provider/server']
+            },
+        }
         for clients in (
-            ['web_safari', 'web_embedded', 'mweb'],
-            ['web', 'web_safari', 'tv'],
-            ['android_vr', 'web_embedded'],
+            ['mweb', 'web_safari'],
+            ['web_safari', 'web_embedded'],
+            ['tv', 'android_vr', 'web_embedded'],
         ):
             o = dict(opts)
-            o['extractor_args'] = {'youtube': {'player_client': clients}}
-            attempts.append((o, 'youtube-client=' + ','.join(clients)))
+            o['extractor_args'] = {
+                'youtube': {'player_client': clients},
+                **pot_args,
+            }
+            attempts.append((o, 'youtube-pot-client=' + ','.join(clients)))
     else:
         retry = dict(opts)
         retry['extractor_args'] = {'generic': {'impersonate': ['chrome']}}
@@ -585,8 +593,7 @@ def analyze():
         opts = {
             "quiet": True, "no_warnings": True, "skip_download": True,
             "noplaylist": True, "retries": 3, "fragment_retries": 3,
-            "socket_timeout": 20, "js_runtimes": {"deno": {}},
-            "check_all_formats": True,
+            "socket_timeout": 20, "js_runtimes": {"deno": {}}, "remote_components": ["ejs:npm"],
         }
         if cp:
             opts["cookiefile"] = cp
@@ -693,10 +700,15 @@ def stream(token):
             cp = cookie_path()
             opts = {
                 "quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
-                "format": fmt["selector"], "socket_timeout": 20, "js_runtimes": {"deno": {}},
+                "format": fmt["selector"], "socket_timeout": 20, "js_runtimes": {"deno": {}}, "remote_components": ["ejs:npm"],
             }
             if cp:
                 opts["cookiefile"] = cp
+            if (urlparse(job["url"]).hostname or "").lower().endswith(("youtube.com", "youtu.be")):
+                opts["extractor_args"] = {
+                    "youtube": {"player_client": ["mweb", "web_safari"]},
+                    "youtubepot-bgutilscript": {"server_home": ["/opt/bgutil-ytdlp-pot-provider/server"]},
+                }
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(job["url"], download=False)
     except Exception as exc:
