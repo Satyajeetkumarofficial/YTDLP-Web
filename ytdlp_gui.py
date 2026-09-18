@@ -692,7 +692,7 @@ function startDownload(token,card){
   const status=card.querySelector('.status');
   btn.disabled=true;
   btn.textContent='Starting…';
-  status.textContent='Streaming from source — check your browser\\'s downloads.';
+  status.textContent="Streaming from source — check your browser's downloads.";
   // Direct navigation lets the browser handle the transfer natively:
   // nothing is buffered on the server, so it starts (and shows progress) immediately.
   window.location.href='/stream/'+encodeURIComponent(token);
