@@ -1,6 +1,6 @@
 import os, re, time, uuid, hmac, json, socket, hashlib, threading, ipaddress, subprocess, logging
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify, render_template_string, Response, stream_with_context
 import yt_dlp
@@ -54,6 +54,16 @@ def hdur(n):
 
 def safe(name):
     return (re.sub(r'[\\/:*?"<>|]+', "_", name or "download")[:180].strip(" .") or "download")
+
+
+def content_disposition(filename):
+    """HTTP headers must be Latin-1/ASCII — a raw emoji or curly-quote title
+    (common on Facebook/Instagram captions) will make the server reject the
+    response outright. Send a plain-ASCII fallback plus an RFC 5987
+    UTF-8 filename* so browsers still show the real name."""
+    ascii_name = safe(name.encode("ascii", "ignore").decode("ascii")) or "download"
+    encoded = quote(name, safe="")
+    return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded}'
 
 
 def client_ip():
@@ -442,7 +452,7 @@ def stream(token):
 
         resp = Response(stream_with_context(generate()),
                          mimetype="video/mp4" if is_mp4 else "video/x-matroska")
-        resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+        resp.headers["Content-Disposition"] = content_disposition(filename)
         return resp
 
     src = requested[0]
@@ -472,7 +482,7 @@ def stream(token):
     for h in ("Content-Length", "Content-Range", "Accept-Ranges", "Content-Type"):
         if h in upstream.headers:
             resp.headers[h] = upstream.headers[h]
-    resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    resp.headers["Content-Disposition"] = content_disposition(filename)
     return resp
 
 
